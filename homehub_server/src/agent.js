@@ -1,0 +1,602 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const OpenAI = require("openai").default;
+const { localDateKey } = require("./domain");
+const { agentToolDefinitions: foodToolDefinitions } = require("./foodTools");
+const { agentToolDefinitions: fitnessToolDefinitions } = require("./fitnessTools");
+
+const toolDefinitions = [...foodToolDefinitions, ...fitnessToolDefinitions];
+const FITNESS_TOOL_NAMES = new Set(fitnessToolDefinitions.map((tool) => tool.name));
+
+const PENDING_TTL_MS = 5 * 60 * 1000;
+const THINK_OPEN_TAG = "<think>";
+const THINK_CLOSE_TAG = "</think>";
+
+function trailingTagPrefixLength(value, tag) {
+  const lower = value.toLowerCase();
+  for (let length = Math.min(tag.length - 1, value.length); length > 0; length -= 1) {
+    if (tag.startsWith(lower.slice(-length))) return length;
+  }
+  return 0;
+}
+
+function createThinkStreamParser(onDelta) {
+  let buffer = "";
+  let mode = "text";
+
+  function flush(final = false) {
+    while (buffer) {
+      const tag = mode === "text" ? THINK_OPEN_TAG : THINK_CLOSE_TAG;
+      const index = buffer.toLowerCase().indexOf(tag);
+      if (index !== -1) {
+        if (index > 0) onDelta(mode, buffer.slice(0, index));
+        buffer = buffer.slice(index + tag.length);
+        mode = mode === "text" ? "reasoning" : "text";
+        continue;
+      }
+      const keep = final ? 0 : trailingTagPrefixLength(buffer, tag);
+      const ready = buffer.slice(0, buffer.length - keep);
+      if (ready) onDelta(mode, ready);
+      buffer = buffer.slice(buffer.length - keep);
+      break;
+    }
+  }
+
+  return {
+    write(value) {
+      buffer += String(value || "");
+      flush(false);
+    },
+    end() {
+      flush(true);
+    }
+  };
+}
+
+function toolDisplayName(name) {
+  const labels = {
+    list_items: "查询物品",
+    get_items: "获取物品详情",
+    create_items: "新增物品",
+    update_items: "修改物品",
+    delete_items: "删除物品"
+  };
+  return labels[name] || "处理物品";
+}
+
+async function streamedChatCompletion(ai, request, emit) {
+  const completion = await ai.chat.completions.create({ ...request, stream: true });
+  const toolCalls = [];
+  let text = "";
+  let reasoning = "";
+  const parser = createThinkStreamParser((type, delta) => {
+    if (!delta) return;
+    if (type === "reasoning") {
+      reasoning += delta;
+      emit({ type: "reasoning_delta", delta });
+      return;
+    }
+    text += delta;
+    emit({ type: "text_delta", delta });
+  });
+
+  for await (const chunk of completion) {
+    const delta = chunk.choices?.[0]?.delta;
+    if (!delta) continue;
+    const reasoningDelta = typeof delta.reasoning_content === "string"
+      ? delta.reasoning_content
+      : typeof delta.reasoning === "string" ? delta.reasoning : "";
+    if (reasoningDelta) {
+      reasoning += reasoningDelta;
+      emit({ type: "reasoning_delta", delta: reasoningDelta });
+    }
+    if (typeof delta.content === "string") parser.write(delta.content);
+    for (const partial of delta.tool_calls || []) {
+      const index = Number.isInteger(partial.index) ? partial.index : 0;
+      toolCalls[index] ||= { id: "", type: "function", function: { name: "", arguments: "" } };
+      if (partial.id) toolCalls[index].id += partial.id;
+      if (partial.type) toolCalls[index].type = partial.type;
+      if (partial.function?.name) toolCalls[index].function.name += partial.function.name;
+      if (partial.function?.arguments) toolCalls[index].function.arguments += partial.function.arguments;
+    }
+  }
+  parser.end();
+
+  const message = { role: "assistant", content: text || null };
+  const completedCalls = toolCalls.filter(Boolean);
+  if (completedCalls.length) message.tool_calls = completedCalls;
+  return { message, reasoning };
+}
+
+function publicConversation(row) {
+  return { id: row.id, title: row.title, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+
+function publicMessage(row) {
+  return { id: row.id, role: row.role, content: row.content, metadata: row.metadata_json ? JSON.parse(row.metadata_json) : null, createdAt: row.created_at };
+}
+
+function summarizeActions(actions) {
+  return actions.map((action) => {
+    if (action.operation === "create") return `新增 ${action.input?.name || "物品"}`;
+    if (action.operation === "update") return `修改 #${action.id}`;
+    return `删除 #${action.id}`;
+  }).join("、");
+}
+
+function createAgentService({ db, foodService, fitnessService = null, timezone = "Asia/Shanghai", resolveRuntime, resolveHouseholdId = (userId) => userId, consumeInput, getQuota, apiKey, model, baseURL, client, clientFactory }) {
+  function householdIdFor(userId) {
+    return resolveHouseholdId(userId);
+  }
+  function runtimeFor(userId) {
+    if (resolveRuntime) return resolveRuntime(userId);
+    if (client && model) return { client, model, baseURL };
+    if (apiKey && model) return { apiKey, model, baseURL };
+    return null;
+  }
+
+  function isConfigured(userId) {
+    return Boolean(runtimeFor(userId));
+  }
+
+  function listConversations(userId) {
+    return db.prepare("SELECT * FROM agent_conversations WHERE user_id = ? ORDER BY updated_at DESC").all(userId).map(publicConversation);
+  }
+
+  function createConversation(userId, title = "新对话") {
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    db.prepare("INSERT INTO agent_conversations (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+      .run(id, userId, String(title || "新对话").trim().slice(0, 60) || "新对话", now, now);
+    return publicConversation(db.prepare("SELECT * FROM agent_conversations WHERE id = ?").get(id));
+  }
+
+  function deleteConversation(userId, id) {
+    const conversation = requireConversation(userId, id);
+    db.prepare("DELETE FROM agent_conversations WHERE id = ? AND user_id = ?").run(String(id), userId);
+    return publicConversation(conversation);
+  }
+
+  function requireConversation(userId, id) {
+    const row = db.prepare("SELECT * FROM agent_conversations WHERE id = ? AND user_id = ?").get(String(id), userId);
+    if (!row) {
+      const error = new Error("conversation not found");
+      error.statusCode = 404;
+      throw error;
+    }
+    return row;
+  }
+
+  function listMessages(userId, conversationId) {
+    requireConversation(userId, conversationId);
+    return db.prepare("SELECT * FROM agent_messages WHERE conversation_id = ? AND protocol IS NULL ORDER BY id ASC").all(conversationId).map(publicMessage).map((message) => {
+      const events = message.metadata?.events;
+      if (!Array.isArray(events)) return message;
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          events: events.map((event) => {
+            if (!event.pendingAction?.id) return event;
+            const pending = db.prepare("SELECT actions_json, resolved_at, resolution FROM agent_pending_actions WHERE id = ? AND user_id = ?").get(event.pendingAction.id, userId);
+            if (!pending) return event;
+            let details = event.pendingAction.details;
+            if (!details && !pending.resolved_at) {
+              try { details = actionDetails(userId, JSON.parse(pending.actions_json)); } catch { details = []; }
+            }
+            return { pendingAction: { ...event.pendingAction, details, resolvedAt: pending.resolved_at, resolution: pending.resolution } };
+          })
+        }
+      };
+    });
+  }
+
+  function saveMessage(conversationId, role, content, metadata = null) {
+    const now = new Date().toISOString();
+    const created = db.prepare("INSERT INTO agent_messages (conversation_id, role, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(conversationId, role, String(content || ""), metadata ? JSON.stringify(metadata) : null, now);
+    db.prepare("UPDATE agent_conversations SET updated_at = ? WHERE id = ?").run(now, conversationId);
+    return publicMessage(db.prepare("SELECT * FROM agent_messages WHERE id = ?").get(Number(created.lastInsertRowid)));
+  }
+
+  function saveProtocolMessage(conversationId, protocol, role, payload) {
+    const now = new Date().toISOString();
+    const content = typeof payload?.content === "string" ? payload.content : "";
+    db.prepare(`
+      INSERT INTO agent_messages (conversation_id, role, content, metadata_json, protocol, payload_json, created_at)
+      VALUES (?, ?, ?, NULL, ?, ?, ?)
+    `).run(conversationId, role, content, protocol, JSON.stringify(payload), now);
+    db.prepare("UPDATE agent_conversations SET updated_at = ? WHERE id = ?").run(now, conversationId);
+  }
+
+  function actionDetails(userId, actions) {
+    return actions.map((action) => {
+      if (action.operation === "create") {
+        return { operation: "create", name: action.input.name, category: action.input.category, quantityText: action.input.quantityText, location: action.input.location, expiresOn: action.input.expiresOn };
+      }
+      const current = foodService.getFoodItem(householdIdFor(userId), action.id);
+      if (action.operation === "update") {
+        return {
+          operation: "update",
+          id: action.id,
+          name: action.patch.name ?? current.name,
+          category: action.patch.category ?? current.category,
+          quantityText: action.patch.quantityText ?? current.quantityText,
+          location: action.patch.location ?? current.location,
+          expiresOn: action.patch.expiresOn ?? current.expiresOn
+        };
+      }
+      return { operation: "delete", id: action.id, name: current.name, category: current.category, quantityText: current.quantityText, location: current.location, expiresOn: current.expiresOn };
+    });
+  }
+
+  function summarizeDetails(details) {
+    const labels = { create: "新增", update: "修改", delete: "删除" };
+    return details.map((detail) => `${labels[detail.operation]}「${detail.name}」`).join("、");
+  }
+
+  function createPendingAction(userId, conversationId, actions, resume = null) {
+    const normalized = foodService.validateActions(householdIdFor(userId), actions);
+    const encodedActions = JSON.stringify(normalized);
+    const details = actionDetails(userId, normalized);
+    const summary = summarizeDetails(details);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const existing = db.prepare(`
+      SELECT * FROM agent_pending_actions
+      WHERE user_id = ? AND conversation_id = ? AND resolved_at IS NULL AND expires_at > ?
+      ORDER BY created_at DESC
+    `).all(userId, conversationId, nowIso).find((row) => row.actions_json === encodedActions);
+    if (existing) {
+      if (resume) db.prepare("UPDATE agent_pending_actions SET resume_json = ? WHERE id = ?").run(JSON.stringify(resume), existing.id);
+      return { id: existing.id, summary: existing.summary, actions: normalized, details, expiresAt: existing.expires_at };
+    }
+    const id = crypto.randomUUID();
+    const expiresAt = new Date(now.getTime() + PENDING_TTL_MS).toISOString();
+    db.prepare(`
+      INSERT INTO agent_pending_actions (id, user_id, conversation_id, actions_json, summary, expires_at, resume_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, userId, conversationId, encodedActions, summary, expiresAt, resume ? JSON.stringify(resume) : null, nowIso);
+    return { id, summary, actions: normalized, details, expiresAt };
+  }
+
+  function executeTool(userId, conversationId, name, args, resume = null) {
+    const householdId = householdIdFor(userId);
+    if (name === "list_items") return foodService.searchFoodItems(householdId, args);
+    if (name === "get_items") return { items: foodService.getFoodItems(householdId, args.ids) };
+    if (name === "create_items") return { status: "executed", results: foodService.createFoodItems(householdId, args.items, { actorUserId: userId, source: "agent" }) };
+    if (name === "update_items") return { status: "executed", results: foodService.updateFoodItems(householdId, args.items, { actorUserId: userId, source: "agent" }) };
+    if (name === "delete_items") {
+      const actions = (args.ids || []).map((id) => ({ operation: "delete", id }));
+      foodService.validateActions(householdId, actions);
+      return { pendingAction: createPendingAction(userId, conversationId, actions, resume) };
+    }
+    if (FITNESS_TOOL_NAMES.has(name)) return executeFitnessTool(userId, name, args);
+    throw new Error("unsupported agent tool");
+  }
+
+  function executeFitnessTool(userId, name, args) {
+    if (!fitnessService) throw new Error("fitness tools are not available");
+    if (name === "list_fitness_exercises") return { exercises: fitnessService.listExercises(userId) };
+    if (name === "get_fitness_day") return fitnessService.getDay(userId, args?.date || localDateKey(timezone));
+    if (name === "get_fitness_overview") return fitnessService.getOverview(userId);
+    if (name === "list_fitness_history") {
+      if (!args?.from || !args?.to) throw new Error("from and to are required");
+      return { items: fitnessService.getHistory(userId, args.from, args.to) };
+    }
+    if (name === "create_fitness_exercise") {
+      return { status: "executed", exercise: fitnessService.createExercise(userId, args || {}) };
+    }
+    if (name === "update_fitness_exercise") {
+      if (!args?.id) throw new Error("id is required");
+      return {
+        status: "executed",
+        exercise: fitnessService.updateExercise(userId, args.id, args.patch || {})
+      };
+    }
+    if (name === "plan_workout_day") {
+      if (!args?.date) throw new Error("date is required");
+      return { status: "executed", ...fitnessService.planDay(userId, args.date) };
+    }
+    if (name === "unplan_workout_day") {
+      if (!args?.date) throw new Error("date is required");
+      return { status: "executed", ...fitnessService.unplanDay(userId, args.date) };
+    }
+    throw new Error("unsupported agent tool");
+  }
+
+  function toolError(error) {
+    return {
+      status: "error",
+      error: error.statusCode === 404 ? "not_found" : "tool_failed",
+      message: error.message
+    };
+  }
+
+  function processToolCalls(userId, conversationId, calls, resumeForCall = () => null) {
+    return calls.map((call) => {
+      try {
+        return {
+          ...call,
+          result: executeTool(userId, conversationId, call.name, call.arguments, resumeForCall(call))
+        };
+      } catch (error) {
+        return { ...call, result: toolError(error) };
+      }
+    });
+  }
+
+  function instructions() {
+    const today = localDateKey(timezone);
+    return `你是小P家事板家庭有效期物品管理助手。今天是 ${today}，时区 ${timezone}。回答简洁、明确。使用 YYYY-MM-DD 展示最终日期。使用 *_items 工具管理物品。\n` +
+      "查询、修改或删除前先列出物品并使用准确 ID；同名匹配多项时必须结合地点追问。" +
+      "调用 list_items 时优先使用 keyword、category、location、status、expiresFrom 或 expiresTo 缩小范围；结果 hasMore 为 true 时按需使用 offset 继续查询。" +
+      `当用户表达添加、新购、刚买、采购、带回等新增语义时，只要物品名称明确且到期信息足够就直接调用 create_items，不要先询问用户确认。对于食品，若未提供日期，把 startDate 设为今天 ${today}，根据名称、品类和常见储存条件选择偏保守且合理的 shelfLifeDays。` +
+      "常见参考：海鲜 1 天，生鲜肉类 2 天，叶菜、菌菇、豆制品和熟食 3 天，牛奶酸奶及多数水果 7 天，鸡蛋 21 天，冷冻食品 90 天；不完全匹配时结合具体食品合理判断。" +
+      "药品、保健品和其他健康相关物品没有明确到期日，或没有明确起始日期与有效天数时必须追问，绝不根据名称猜测有效期，也不提供是否可继续使用、剂量或疗效等用药判断。" +
+      "用户没说品类时可根据名称推断；没说数量或地点时可以省略，不要为此追问。用户明确提供的日期、数量、地点或有效天数优先。工具成功后简要说明已添加物品、地点和到期日，并告知用户可继续对话修改。" +
+      "所有 get/create/update/delete 工具都接收 1 到 25 项；尽量把同类操作合并成一次批量调用。update_items 只在 patch 中填写需要修改的字段；如果修改 startDate 或 shelfLifeDays 后要重新计算到期日，同时传 expiresOn: null。" +
+      "识别出准确删除对象后直接调用 delete_items，不要先询问用户是否确认；删除确认完全由系统执行层处理，模型无需说明确认流程。" +
+      "调用工具时不要输出正在查询、正在调用、准备删除等中间过程，也不要重复展示系统确认卡已经提供的待操作清单。" +
+      "不要声称操作成功，除非工具结果明确显示 status 为 executed。不要重复提交同一批变更。" +
+      "你也可以管理健身板块：list_fitness_exercises 查看训练项目，create_fitness_exercise 新建项目，update_fitness_exercise 按准确 ID 部分更新（格式 { id, patch }，patch 只填要改的字段），plan_workout_day 预约未来某天训练，unplan_workout_day 取消预约，get_fitness_overview、get_fitness_day、list_fitness_history 查看今日状态、某天详情与历史。" +
+      "健身项目 type 取 anaerobic（无氧，使用 sets、reps、weightKg、weightMode）或 aerobic（有氧，使用 defaultDurationMin、defaultDistanceKm、defaultIncline）；priorityWeight 只允许 0.5、1、1.5、2。日期一律 YYYY-MM-DD，预约只能针对未来日期。" +
+      "开始训练、组打卡、有氧打卡和结束训练不能通过工具执行，必须由用户本人在健身页面完成；用户提出这类要求时说明原因即可。";
+  }
+
+  function sanitizeChatHistory(messages) {
+    const toolResults = new Map(messages
+      .filter((message) => message.role === "tool" && message.tool_call_id)
+      .map((message) => [message.tool_call_id, message]));
+    const history = [];
+    for (const message of messages) {
+      if (message.role === "tool") continue;
+      if (!Array.isArray(message.tool_calls)) {
+        history.push(message);
+        continue;
+      }
+      const results = message.tool_calls.map((call) => toolResults.get(call.id));
+      if (results.every(Boolean)) history.push(message, ...results);
+    }
+    return history;
+  }
+
+  function recentHistory(conversationId) {
+    const rows = db.prepare(`
+      SELECT role, content, protocol, payload_json FROM agent_messages
+      WHERE conversation_id = ? AND (protocol IS NULL OR protocol = 'chat')
+      ORDER BY id DESC LIMIT 40
+    `).all(conversationId).reverse();
+    const firstUserIndex = rows.findIndex((row) => row.role === "user" && row.protocol === null);
+    if (firstUserIndex === -1) return [];
+    const messages = rows.slice(firstUserIndex).map((row) => {
+      if (!row.payload_json) return { role: row.role, content: row.content };
+      try { return JSON.parse(row.payload_json); } catch { return { role: row.role, content: row.content }; }
+    });
+    return sanitizeChatHistory(messages);
+  }
+
+  async function runChat(userId, conversationId, history, ai, activeModel) {
+    const messages = [{ role: "system", content: instructions() }, ...history];
+    const events = [];
+    for (let round = 0; round < 6; round += 1) {
+      const response = await ai.chat.completions.create({
+        model: activeModel,
+        messages,
+        tools: toolDefinitions.map((tool) => ({ type: "function", function: tool })),
+        tool_choice: "auto",
+        parallel_tool_calls: false
+      });
+      const choice = response.choices[0]?.message;
+      if (!choice) throw new Error("model returned no message");
+      messages.push(choice);
+      const calls = (choice.tool_calls || []).map((call) => ({ id: call.id, name: call.function.name, arguments: JSON.parse(call.function.arguments || "{}") }));
+      if (!calls.length) return { text: choice.content || "操作已处理。", events };
+      saveProtocolMessage(conversationId, "chat", "assistant", choice);
+      const handled = processToolCalls(userId, conversationId, calls, () => ({ protocol: "chat", messages }));
+      events.push(...handled.map((call) => call.result));
+      if (handled.some((call) => call.result.pendingAction)) return { text: "", events };
+      for (const call of handled) {
+        const toolMessage = { role: "tool", tool_call_id: call.id, content: JSON.stringify(call.result) };
+        saveProtocolMessage(conversationId, "chat", "tool", toolMessage);
+        messages.push(toolMessage);
+      }
+    }
+    throw new Error("agent exceeded the tool-call limit");
+  }
+
+  async function runChatStream(userId, conversationId, history, ai, activeModel, emit) {
+    const messages = [{ role: "system", content: instructions() }, ...history];
+    const events = [];
+    const reasoningParts = [];
+    for (let round = 0; round < 6; round += 1) {
+      emit({ type: "status", status: "thinking", label: round === 0 ? "正在思考…" : "正在整理工具结果…" });
+      const streamed = await streamedChatCompletion(ai, {
+        model: activeModel,
+        messages,
+        tools: toolDefinitions.map((tool) => ({ type: "function", function: tool })),
+        tool_choice: "auto",
+        parallel_tool_calls: false
+      }, emit);
+      const choice = streamed.message;
+      if (streamed.reasoning.trim()) reasoningParts.push(streamed.reasoning.trim());
+      messages.push(choice);
+      const calls = (choice.tool_calls || []).map((call) => ({
+        id: call.id,
+        name: call.function.name,
+        arguments: JSON.parse(call.function.arguments || "{}")
+      }));
+      if (!calls.length) {
+        const text = choice.content || "操作已处理。";
+        if (!choice.content) emit({ type: "text_delta", delta: text });
+        return { text, events, reasoning: reasoningParts.join("\n\n") };
+      }
+      saveProtocolMessage(conversationId, "chat", "assistant", choice);
+      for (const call of calls) {
+        emit({ type: "tool_start", id: call.id, name: call.name, label: toolDisplayName(call.name) });
+      }
+      const handled = processToolCalls(userId, conversationId, calls, () => ({ protocol: "chat", messages }));
+      events.push(...handled.map((call) => call.result));
+      for (const call of handled) {
+        const status = call.result.pendingAction ? "waiting_confirmation" : call.result.status === "error" ? "error" : "completed";
+        emit({ type: "tool_end", id: call.id, name: call.name, label: toolDisplayName(call.name), status });
+        emit({ type: "agent_event", event: call.result });
+      }
+      if (handled.some((call) => call.result.pendingAction)) {
+        return { text: "", events, reasoning: reasoningParts.join("\n\n") };
+      }
+      for (const call of handled) {
+        const toolMessage = { role: "tool", tool_call_id: call.id, content: JSON.stringify(call.result) };
+        saveProtocolMessage(conversationId, "chat", "tool", toolMessage);
+        messages.push(toolMessage);
+      }
+    }
+    throw new Error("agent exceeded the tool-call limit");
+  }
+
+  function clientFor(runtime) {
+    return runtime.client || (clientFactory
+      ? clientFactory(runtime)
+      : new OpenAI({ apiKey: runtime.apiKey, baseURL: runtime.baseURL || undefined, timeout: 60000, maxRetries: 1 }));
+  }
+
+  function executedSummary(results) {
+    const labels = { create: "新增", update: "修改", delete: "删除" };
+    return results.map((result) => `${labels[result.operation] || "处理"}「${result.item?.name || "物品"}」`).join("、");
+  }
+
+  async function resumePendingReply(userId, row, toolResult, fallback) {
+    const runtime = runtimeFor(userId);
+    if (!runtime) return fallback;
+    let resume;
+    try { resume = row.resume_json ? JSON.parse(row.resume_json) : null; } catch { resume = null; }
+    if (!resume) return fallback;
+    const ai = clientFor(runtime);
+    const history = recentHistory(row.conversation_id);
+    try {
+      const chatMessages = Array.isArray(resume.messages)
+        ? resume.messages
+        : resume.assistantMessage
+          ? [{ role: "system", content: instructions() }, ...history, resume.assistantMessage]
+          : null;
+      if (resume.protocol === "chat" && chatMessages) {
+        const assistantCall = [...chatMessages].reverse().find((message) => Array.isArray(message.tool_calls));
+        const callId = assistantCall?.tool_calls?.[0]?.id;
+        if (!callId) return fallback;
+        const toolMessage = { role: "tool", tool_call_id: callId, content: JSON.stringify(toolResult) };
+        saveProtocolMessage(row.conversation_id, "chat", "tool", toolMessage);
+        const response = await ai.chat.completions.create({
+          model: runtime.model,
+          messages: [
+            ...chatMessages,
+            toolMessage
+          ],
+          tools: toolDefinitions.map((tool) => ({ type: "function", function: tool })),
+          tool_choice: "none"
+        });
+        return response.choices[0]?.message?.content || fallback;
+      }
+      return fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  async function sendMessage(userId, conversationId, content) {
+    const runtime = runtimeFor(userId);
+    if (!runtime) {
+      const error = new Error("Agent 未配置，请填写个人 API Key 或联系管理员配置系统 Agent");
+      error.statusCode = 503;
+      throw error;
+    }
+    const ai = clientFor(runtime);
+    const conversation = requireConversation(userId, conversationId);
+    const text = String(content || "").trim().slice(0, 4000);
+    if (!text) throw new Error("message is required");
+    const quota = runtime.mode === "personal"
+      ? (getQuota ? getQuota(userId) : null)
+      : consumeInput ? consumeInput(userId) : (getQuota ? getQuota(userId) : null);
+    saveMessage(conversationId, "user", text);
+    if (conversation.title === "新对话") db.prepare("UPDATE agent_conversations SET title = ? WHERE id = ?").run(text.slice(0, 30), conversationId);
+    const result = await runChat(userId, conversationId, recentHistory(conversationId), ai, runtime.model);
+    const metadata = { events: result.events };
+    const message = saveMessage(conversationId, "assistant", result.text, metadata);
+    return { message, events: result.events, mode: runtime.mode || "system", ...(quota ? { quota } : {}) };
+  }
+
+  async function sendMessageStream(userId, conversationId, content, emit = () => {}) {
+    const runtime = runtimeFor(userId);
+    if (!runtime) {
+      const error = new Error("Agent 未配置，请填写个人 API Key 或联系管理员配置系统 Agent");
+      error.statusCode = 503;
+      throw error;
+    }
+    const ai = clientFor(runtime);
+    const conversation = requireConversation(userId, conversationId);
+    const text = String(content || "").trim().slice(0, 4000);
+    if (!text) throw new Error("message is required");
+    const quota = runtime.mode === "personal"
+      ? (getQuota ? getQuota(userId) : null)
+      : consumeInput ? consumeInput(userId) : (getQuota ? getQuota(userId) : null);
+    saveMessage(conversationId, "user", text);
+    if (conversation.title === "新对话") db.prepare("UPDATE agent_conversations SET title = ? WHERE id = ?").run(text.slice(0, 30), conversationId);
+    const result = await runChatStream(userId, conversationId, recentHistory(conversationId), ai, runtime.model, emit);
+    const metadata = { events: result.events, ...(result.reasoning ? { reasoning: result.reasoning } : {}) };
+    const message = saveMessage(conversationId, "assistant", result.text, metadata);
+    return { message, events: result.events, mode: runtime.mode || "system", ...(quota ? { quota } : {}) };
+  }
+
+  async function resolvePending(userId, id, confirm) {
+    const now = new Date().toISOString();
+    const row = db.prepare("SELECT * FROM agent_pending_actions WHERE id = ? AND user_id = ?").get(String(id), userId);
+    if (!row) {
+      const error = new Error("pending action not found");
+      error.statusCode = 404;
+      throw error;
+    }
+    if (row.resolved_at) {
+      const recent = db.prepare("SELECT * FROM agent_messages WHERE conversation_id = ? AND created_at >= ? ORDER BY id DESC LIMIT 20")
+        .all(row.conversation_id, row.resolved_at).map(publicMessage);
+      const message = recent.find((item) => item.metadata?.executed || item.metadata?.cancelled) || null;
+      return {
+        alreadyResolved: true,
+        resolution: row.resolution,
+        executed: message?.metadata?.executed,
+        cancelled: row.resolution === "cancelled",
+        message
+      };
+    }
+    if (row.expires_at <= now) throw new Error("pending action has expired");
+    if (!confirm) {
+      db.prepare("UPDATE agent_pending_actions SET resolved_at = ?, resolution = 'cancelled' WHERE id = ? AND resolved_at IS NULL").run(now, row.id);
+      const fallback = `已取消：${row.summary}。`;
+      const reply = await resumePendingReply(userId, row, { status: "cancelled", summary: row.summary }, fallback);
+      const message = saveMessage(row.conversation_id, "assistant", reply, { cancelled: true, toolResultReturned: true });
+      return { cancelled: true, message };
+    }
+    const actions = JSON.parse(row.actions_json);
+    const results = foodService.applyActions(householdIdFor(userId), actions, { actorUserId: userId, source: "agent" });
+    const changed = db.prepare("UPDATE agent_pending_actions SET resolved_at = ?, resolution = 'confirmed' WHERE id = ? AND resolved_at IS NULL").run(now, row.id);
+    if (!changed.changes) throw new Error("pending action has already been resolved");
+    const reply = await resumePendingReply(userId, row, { status: "executed", results }, `已执行：${executedSummary(results)}。`);
+    const message = saveMessage(row.conversation_id, "assistant", reply, { executed: results, toolResultReturned: true });
+    return { executed: results, message };
+  }
+
+  return {
+    isConfigured,
+    listConversations,
+    createConversation,
+    deleteConversation,
+    listMessages,
+    sendMessage,
+    sendMessageStream,
+    confirmAction: (userId, id) => resolvePending(userId, id, true),
+    cancelAction: (userId, id) => resolvePending(userId, id, false),
+    instructions,
+    executeTool
+  };
+}
+
+module.exports = { PENDING_TTL_MS, createAgentService, summarizeActions, toolDefinitions };

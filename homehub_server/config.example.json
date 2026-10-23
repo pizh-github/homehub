@@ -1,0 +1,15 @@
+{
+  "host": "127.0.0.1",
+  "port": 8788,
+  "timezone": "Asia/Shanghai",
+  "databasePath": "data/homehub.sqlite",
+  "secureCookies": false,
+  "adminLogin": "admin",
+  "adminEmail": "",
+  "adminPassword": "change-this-password",
+  "demoDeviceToken": "change-this-device-token",
+  "credentialEncryptionKey": "replace-with-a-long-random-secret",
+  "asrApiKey": "",
+  "asrModel": "fun-asr-flash-2026-06-15",
+  "asrBaseUrl": "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
+}

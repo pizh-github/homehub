@@ -1,0 +1,37 @@
+# 小P家事板（HomeHub）容器编排
+#
+# 使用方式：
+#   cp config.example.json config.json   # 填账号与密钥
+#   mkdir -p data
+#   sudo docker compose up -d --build
+#
+# 说明：
+#   - 仓库根目录即部署目录，代码通过 .:/app 挂载，改代码后 restart 即生效
+#   - node_modules 放在命名卷里，不污染宿主机目录（首次启动自动 npm ci）
+#   - data/ 存放 SQLite 数据库；config.json 含密钥，二者都不进 Git
+
+name: homehub
+
+services:
+  homehub:
+    build: .
+    container_name: homehub
+    working_dir: /app
+    restart: unless-stopped
+    ports:
+      - "8788:8788"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8788
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+      - homehub_node_modules:/app/node_modules
+    # Chromium 需要较大的 /dev/shm，默认 64MB 会崩
+    shm_size: 512mb
+    command: >
+      sh -c "test -d node_modules/.bin || npm ci;
+             exec node --no-warnings=ExperimentalWarning src/server.js"
+
+volumes:
+  homehub_node_modules:
