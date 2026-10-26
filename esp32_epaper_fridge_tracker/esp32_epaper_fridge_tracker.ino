@@ -81,6 +81,10 @@ uint8_t* imageData = nullptr;
 bool resumeAfterSave = false;
 bool portalRoutesConfigured = false;
 unsigned long resumeAt = 0;
+bool g_timerWakeup = false; // true when this boot came from the deep-sleep timer
+bool endpointIsLocal = false; // cached classification of settings.apiBaseUrl
+uint8_t failCount = 0; // persisted consecutive-failure counter for the retry backoff
+uint32_t g_nextCheckSeconds = 0; // one-shot wake time from the server's smart schedule
 char errorTitle[32] = "Refresh failed";
 char errorDetail[52] = "";
 char errorHint[52] = "Power cycle for setup";
@@ -92,7 +96,13 @@ void clearSettings();
 bool forceSetupRequested();
 bool wokeFromTimer();
 uint32_t configuredPortalTimeoutMs();
-bool configureWifiRadio();
+bool isLocalApiUrl(const String& url);
+uint32_t wifiConnectTimeoutMs();
+uint32_t backoffCapSeconds();
+uint32_t backoffSeconds(uint8_t count);
+void recordFailure();
+void clearFailures();
+bool configureWifiRadio(bool modemSleep);
 bool startProvisioningAccessPoint(const String& apName);
 bool runProvisioningPortal(uint32_t timeoutMs = 0, bool showInstructions = true);
 void stopProvisioningPortal();
@@ -103,7 +113,9 @@ String htmlEscape(const String& text);
 String jsonEscape(const String& text);
 String joinApiUrl(const char* resource);
 bool connectWiFi();
+bool tryConnectUntil(uint8_t channel, unsigned long deadline);
 bool beginHttp(HTTPClient& http, WiFiClient& client, WiFiClientSecure& secureClient, const String& url);
+void readScheduleHeaders(HTTPClient& http);
 bool registerDevice();
 String jsonStringField(const String& body, const char* key);
 FrameResult fetchNativeFrame();
@@ -114,20 +126,33 @@ void releaseNetwork();
 void logHeap(const char* label);
 void drawStatusText(const char* line1, const char* line2, const char* line3, const char* line4 = "");
 void setError(const char* title, const char* detail, const char* hint);
-void sleepForNextCheck(bool fastRetry, uint64_t elapsedUs = 0);
+uint32_t contentFingerprint(const char* line1, const char* line2, const char* line3, const char* line4);
+uint32_t storedScreenFingerprint();
+void storeScreenFingerprint(uint32_t fingerprint);
+void clearScreenFingerprint();
+void drawErrorPage();
+bool showStoredFrame();
+void bumpRequestCount();
+bool batterySamplingDue();
+int readStoredBatteryPercent();
+int batteryPercentForDraw();
+void sleepForNextCheck(bool failed, uint64_t elapsedUs = 0);
 int readBatteryPercent();
 void drawBatteryOnPlane(uint8_t* plane, int percent, const String& orientation, bool isRedPlane);
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
-  delay(SERIAL_BOOT_DELAY_MS);
+  g_timerWakeup = wokeFromTimer();
+  // The boot delay is also the window for holding BOOT to clear the provisioning
+  // settings (forceSetupRequested() runs after it), so only timer wakes may skip it.
+  delay(g_timerWakeup ? TIMER_WAKE_SERIAL_DELAY_MS : SERIAL_BOOT_DELAY_MS);
   Serial.println();
   Serial.print("=== XianZhi Tie e-paper boot: ");
   Serial.print(FRIDGE_BOARD_NAME);
   Serial.print(" / ");
   Serial.print(PANEL_PROFILE);
   Serial.println(" ===");
-  bool timerWakeup = wokeFromTimer();
+  bool timerWakeup = g_timerWakeup;
   Serial.print("Wake source: ");
   Serial.println(timerWakeup ? "deep-sleep timer" : "power-on/reset");
 
@@ -138,12 +163,14 @@ void setup() {
     delay(100);
   }
   SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, EPD_CS);
-  display.init();
-  display.setRotation(1);
-  logHeap("Heap after display init");
+  // The panel is deliberately left asleep here: drawStatusText() and
+  // drawStoredImage() each call display.init() right before they draw, so a wake
+  // that ends in HTTP 304 (or in no drawing at all) never wakes the controller.
+  logHeap("Heap after SPI begin (panel left sleeping)");
 
   if (!FFat.begin(true)) {
-    drawStatusText("Storage failed", "Cannot mount FATFS", "");
+    setError("Storage failed", "Cannot mount FATFS", "");
+    drawErrorPage();
     display.hibernate();
     sleepForNextCheck(true);
   }
@@ -155,7 +182,8 @@ void setup() {
     imageData = static_cast<uint8_t*>(malloc(DISPLAY_IMAGE_BYTES));
   }
   if (!imageData) {
-    drawStatusText("Memory failed", "Frame allocation", "Check PSRAM setting");
+    setError("Memory failed", "Frame allocation", "Check PSRAM setting");
+    drawErrorPage();
     display.hibernate();
     sleepForNextCheck(true);
   }
@@ -189,9 +217,9 @@ void setup() {
       display.hibernate();
       restartForConfigApply();
     }
-    drawStatusText("Wi-Fi failed", "Cannot connect", "Power cycle for setup");
+    drawErrorPage();
     display.hibernate();
-    sleepForNextCheck(!hasStoredImage(), portalElapsedUs);
+    sleepForNextCheck(true, portalElapsedUs);
   }
 
   if (settings.deviceToken.isEmpty() && !registerDevice()) {
@@ -207,7 +235,7 @@ void setup() {
       }
     }
     if (!storedImageAvailable) {
-      drawStatusText(errorTitle, errorDetail, errorHint);
+      drawErrorPage();
     }
     display.hibernate();
     sleepForNextCheck(true, portalElapsedUs);
@@ -216,16 +244,12 @@ void setup() {
   FrameResult result = fetchNativeFrame();
   releaseNetwork();
   if (result == FRAME_UPDATED) {
-    if (!drawStoredImage()) {
-      drawStatusText(errorTitle, errorDetail, errorHint);
-    }
+    showStoredFrame();
   } else if (result == FRAME_UNCHANGED && settings.forceRefreshEveryCheck) {
     Serial.println("Debug refresh enabled; redrawing the cached frame after HTTP 304.");
-    if (!drawStoredImage()) {
-      drawStatusText(errorTitle, errorDetail, errorHint);
-    }
+    showStoredFrame();
   } else if (result == FRAME_FAILED && !hasStoredImage()) {
-    drawStatusText(errorTitle, errorDetail, errorHint);
+    drawErrorPage();
   } else {
     Serial.println("Retaining the current e-paper image.");
   }
@@ -268,6 +292,7 @@ bool loadSettings() {
   settings.orientation = prefs.getString("orient", "portrait");
   settings.checkIntervalMinutes = prefs.getUInt("interval", DEFAULT_CHECK_INTERVAL_MINUTES);
   settings.forceRefreshEveryCheck = prefs.getBool("force", false);
+  failCount = prefs.getUChar(FAIL_COUNT_KEY, 0);
   prefs.end();
   if (settings.checkIntervalMinutes < MIN_CHECK_INTERVAL_MINUTES ||
       settings.checkIntervalMinutes > MAX_CHECK_INTERVAL_MINUTES) {
@@ -276,6 +301,7 @@ bool loadSettings() {
   if (settings.orientation != "portrait" && settings.orientation != "landscape") {
     settings.orientation = "portrait";
   }
+  endpointIsLocal = isLocalApiUrl(settings.apiBaseUrl);
   return settingsReady();
 }
 
@@ -318,8 +344,94 @@ uint32_t configuredPortalTimeoutMs() {
     : MAX_POWER_ON_PORTAL_TIMEOUT_MS;
 }
 
-bool configureWifiRadio() {
-  WiFi.setSleep(false);
+// Classify the configured API base URL without any network probing: plain HTTP,
+// private/link-local IPv4 literals and mDNS-style host names are treated as LAN.
+bool isLocalApiUrl(const String& url) {
+  int schemeEnd = url.indexOf("://");
+  String scheme = schemeEnd > 0 ? url.substring(0, schemeEnd) : String("http");
+  scheme.toLowerCase();
+  int hostStart = schemeEnd > 0 ? schemeEnd + 3 : 0;
+  int hostEnd = url.indexOf('/', hostStart);
+  if (hostEnd < 0) {
+    hostEnd = url.length();
+  }
+  String authority = url.substring(hostStart, hostEnd);
+  int at = authority.lastIndexOf('@');
+  if (at >= 0) {
+    authority = authority.substring(at + 1);
+  }
+  int colon = authority.indexOf(':');
+  String host = colon >= 0 ? authority.substring(0, colon) : authority;
+  host.toLowerCase();
+
+  if (scheme == "http") {
+    return true; // HTTPS to a public host is the only case that pays for TLS
+  }
+  if (host == "localhost") {
+    return true;
+  }
+  if (host.endsWith(".local") || host.endsWith(".lan") || host.endsWith(".home")) {
+    return true;
+  }
+  int a = 0, b = 0, c = 0, d = 0;
+  if (sscanf(host.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+    if (a == 10 || a == 127) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 169 && b == 254) return true;
+  }
+  return false;
+}
+
+uint32_t wifiConnectTimeoutMs() {
+  // Stay conservative until registration succeeded: a slow router or a first DNS
+  // lookup must never be mistaken for a setup failure.
+  if (settings.deviceToken.isEmpty()) {
+    return WIFI_TIMEOUT_MS;
+  }
+  return endpointIsLocal ? WIFI_TIMEOUT_MS_LOCAL : WIFI_TIMEOUT_MS_PUBLIC;
+}
+
+uint32_t backoffCapSeconds() {
+  // The configured interval is the floor for every retry path: retries grow until
+  // they reach it and then keep using it.
+  uint32_t configured = settings.checkIntervalMinutes * 60UL;
+  return configured > BACKOFF_MIN_SECONDS ? configured : BACKOFF_MIN_SECONDS;
+}
+
+uint32_t backoffSeconds(uint8_t count) {
+  uint32_t cap = backoffCapSeconds();
+  uint32_t seconds = BACKOFF_MIN_SECONDS;
+  for (uint8_t step = 1; step < count && seconds < cap; step++) {
+    seconds = seconds > cap / 2 ? cap : seconds * 2;
+  }
+  return seconds > cap ? cap : seconds;
+}
+
+void recordFailure() {
+  if (failCount < 255) {
+    failCount += 1;
+  }
+  prefs.begin("fridge", false);
+  prefs.putUChar(FAIL_COUNT_KEY, failCount);
+  prefs.end();
+}
+
+void clearFailures() {
+  if (failCount == 0) {
+    return;
+  }
+  failCount = 0;
+  prefs.begin("fridge", false);
+  prefs.putUChar(FAIL_COUNT_KEY, 0);
+  prefs.end();
+}
+
+bool configureWifiRadio(bool modemSleep) {
+  // Modem sleep is only enabled once a connect attempt is clearly going to take
+  // a while: there is no data to move during that wait, so letting the radio nap
+  // between beacons is free. Downloads keep the radio fully awake.
+  WiFi.setSleep(modemSleep);
 #if FRIDGE_LIMIT_WIFI_TX_POWER
   bool powerSet = WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.print("Wi-Fi reduced TX power: ");
@@ -338,7 +450,7 @@ bool startProvisioningAccessPoint(const String& apName) {
 
     // AP+STA keeps the setup hotspot online while the portal scans nearby SSIDs.
     bool modeReady = WiFi.mode(WIFI_AP_STA);
-    bool powerSet = configureWifiRadio();
+    bool powerSet = configureWifiRadio(false); // AP mode always keeps the radio awake
     delay(WIFI_MODE_TRANSITION_DELAY_MS);
 
     bool apStarted = modeReady &&
@@ -449,6 +561,13 @@ bool runProvisioningPortal(uint32_t timeoutMs, bool showInstructions) {
         prefs.remove("token");
         prefs.remove("etag");
       }
+      prefs.end();
+      // A new configuration invalidates the retry backoff, the cached screen
+      // fingerprint and the remembered Wi-Fi channel (the SSID may have changed).
+      clearFailures();
+      clearScreenFingerprint();
+      prefs.begin("fridge", false);
+      prefs.remove(WIFI_CHANNEL_KEY);
       prefs.end();
       if (submitsToken || identityChanged) {
         FFat.remove(IMAGE_PATH);
@@ -566,35 +685,97 @@ String joinApiUrl(const char* resource) {
   return url;
 }
 
+bool tryConnectUntil(uint8_t channel, unsigned long deadline) {
+  WiFi.setSleep(false); // every attempt starts at full speed
+  Serial.print("Connecting Wi-Fi: ");
+  Serial.print(settings.ssid);
+  if (channel > 0) {
+    // Remembering the channel lets the radio skip the 1-13 channel scan. The
+    // BSSID is deliberately not cached so mesh/multi-AP setups still connect.
+    Serial.print(" (cached channel ");
+    Serial.print(channel);
+    Serial.print(")");
+    WiFi.begin(settings.ssid.c_str(), settings.password.c_str(), channel, nullptr);
+  } else {
+    Serial.print(" (full channel scan)");
+    WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
+  }
+  Serial.print(" ");
+  unsigned long startedAt = millis();
+  bool modemSleep = false;
+  while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+    wl_status_t status = WiFi.status();
+    if (status == WL_NO_SSID_AVAIL || status == WL_CONNECT_FAILED) {
+      // A definitive failure (wrong channel / refused): stop waiting and let the
+      // caller fall back to a full scan instead of burning the whole budget.
+      break;
+    }
+    if (!modemSleep && millis() - startedAt >= WIFI_MODEM_SLEEP_AFTER_MS) {
+      WiFi.setSleep(true);
+      modemSleep = true;
+      Serial.print("[modem sleep]");
+    }
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
 bool connectWiFi() {
   logHeap("Heap before Wi-Fi");
   bool modeReady = WiFi.mode(WIFI_STA);
   delay(WIFI_MODE_TRANSITION_DELAY_MS);
-  bool powerSet = configureWifiRadio();
+  bool powerSet = configureWifiRadio(false); // full speed while associating
+  uint32_t timeoutMs = wifiConnectTimeoutMs();
   Serial.print("Wi-Fi station mode: ");
   Serial.print(modeReady ? "ready" : "failed");
   Serial.print(", power: ");
-  Serial.println(powerSet ? "set" : "failed");
+  Serial.print(powerSet ? "set" : "failed");
+  Serial.print(", endpoint: ");
+  Serial.print(endpointIsLocal ? "local" : "public");
+  Serial.print(", timeout ms: ");
+  Serial.println(timeoutMs);
   if (!modeReady) {
     setError("Wi-Fi failed", "Cannot start radio", "Power cycle for setup");
     return false;
   }
-  WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
-  Serial.print("Connecting Wi-Fi: ");
-  Serial.print(settings.ssid);
-  Serial.print(" ");
-  unsigned long startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_TIMEOUT_MS) {
-    delay(400);
-    Serial.print(".");
+
+  prefs.begin("fridge", true);
+  uint8_t cachedChannel = prefs.getUChar(WIFI_CHANNEL_KEY, 0);
+  prefs.end();
+
+  bool connected = false;
+  if (cachedChannel > 0) {
+    connected = tryConnectUntil(cachedChannel, millis() + WIFI_FAST_CONNECT_TIMEOUT_MS);
+    if (!connected) {
+      // The AP may have moved to another channel, or the device was moved.
+      Serial.println("Cached channel failed; retrying with a full scan.");
+      WiFi.disconnect();
+      delay(WIFI_MODE_TRANSITION_DELAY_MS);
+    }
   }
-  Serial.println();
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!connected) {
+    // The fallback gets a fresh full budget: it is rare, and it must succeed.
+    connected = tryConnectUntil(0, millis() + timeoutMs);
+  }
+  if (!connected) {
     setError("Wi-Fi failed", "Cannot connect", "Power cycle for setup");
     return false;
   }
+
+  // Restore full-speed radio for the download phase.
+  WiFi.setSleep(false);
+  uint8_t usedChannel = uint8_t(WiFi.channel());
+  if (usedChannel > 0 && usedChannel != cachedChannel) {
+    prefs.begin("fridge", false);
+    prefs.putUChar(WIFI_CHANNEL_KEY, usedChannel);
+    prefs.end();
+  }
   Serial.print("Wi-Fi IP: ");
   Serial.println(WiFi.localIP());
+  Serial.print("Wi-Fi channel cached: ");
+  Serial.println(usedChannel);
   logHeap("Heap after Wi-Fi");
   return true;
 }
@@ -669,7 +850,50 @@ String jsonStringField(const String& body, const char* key) {
   return body.substring(start, end);
 }
 
+// Smart schedule: the server may answer with a one-shot wake time and/or a new
+// hardware interval. Both are optional; missing headers keep the current behaviour.
+void readScheduleHeaders(HTTPClient& http) {
+  g_nextCheckSeconds = 0;
+  String hintHeader = http.header("X-Next-Check-Seconds");
+  String intervalHeader = http.header("X-Check-Interval-Seconds");
+
+  uint32_t hint = uint32_t(hintHeader.toInt());
+  uint32_t intervalSeconds = uint32_t(intervalHeader.toInt());
+
+  if (intervalSeconds >= MIN_CHECK_INTERVAL_MINUTES * 60UL &&
+      intervalSeconds <= MAX_CHECK_INTERVAL_MINUTES * 60UL) {
+    uint32_t minutes = intervalSeconds / 60UL;
+    if (minutes != settings.checkIntervalMinutes) {
+      settings.checkIntervalMinutes = minutes;
+      prefs.begin("fridge", false);
+      prefs.putUInt("interval", minutes);
+      prefs.end();
+      Serial.print("Interval updated by server, minutes: ");
+      Serial.println(minutes);
+    }
+  }
+
+  if (hint > 0) {
+    // No policy limits here: the device sleeps exactly as long as the server asks.
+    // The sanity bound only rejects absurd values from a parsing failure.
+    if (hint <= SMART_HINT_SANITY_MAX_SECONDS) {
+      g_nextCheckSeconds = hint;
+    } else {
+      Serial.print("Ignoring implausible schedule hint seconds: ");
+      Serial.println(hint);
+    }
+  }
+
+  if (!hintHeader.isEmpty() || !intervalHeader.isEmpty()) {
+    Serial.print("Schedule headers: hint=");
+    Serial.print(hint);
+    Serial.print(", interval=");
+    Serial.println(intervalSeconds);
+  }
+}
+
 FrameResult fetchNativeFrame() {
+  bumpRequestCount();
   logHeap("Heap before frame request");
   HTTPClient http;
   WiFiClient client;
@@ -678,6 +902,10 @@ FrameResult fetchNativeFrame() {
   url += PANEL_PROFILE;
   url += "&orientation=";
   url += settings.orientation;
+  // Report the current hardware interval so the server can show it and keep its copy
+  // in sync (a change made on the device page wins over the stored value).
+  url += "&interval=";
+  url += String(settings.checkIntervalMinutes);
   Serial.print("Downloading frame: ");
   Serial.println(url);
 
@@ -686,8 +914,9 @@ FrameResult fetchNativeFrame() {
     return FRAME_FAILED;
   }
 
-  const char* keys[] = { "ETag" };
-  http.collectHeaders(keys, 1);
+  // Every custom header must be collected, otherwise http.header() silently returns "".
+  const char* keys[] = { "ETag", "X-Next-Check-Seconds", "X-Check-Interval-Seconds" };
+  http.collectHeaders(keys, 3);
   http.setTimeout(DOWNLOAD_TIMEOUT_MS);
   http.addHeader("Authorization", "Bearer " + settings.deviceToken);
   if (!settings.etag.isEmpty() && hasStoredImage()) {
@@ -699,6 +928,7 @@ FrameResult fetchNativeFrame() {
   int status = http.GET();
   if (status == HTTP_CODE_NOT_MODIFIED) {
     Serial.println("Frame is unchanged.");
+    readScheduleHeaders(http); // the 304 response carries the schedule too
     http.end();
     return FRAME_UNCHANGED;
   }
@@ -711,6 +941,7 @@ FrameResult fetchNativeFrame() {
   }
 
   String newEtag = http.header("ETag");
+  readScheduleHeaders(http);
   if (!storeDownloadedFrame(http)) {
     http.end();
     return FRAME_FAILED;
@@ -918,6 +1149,52 @@ int readBatteryPercent() {
   return 0;
 }
 
+// Every wake issues exactly one frame request, so the request counter is a stable
+// clock for the battery sample cadence (~1 day at the 50-request threshold).
+void bumpRequestCount() {
+  prefs.begin("fridge", false);
+  uint16_t count = prefs.getUShort(REQUEST_COUNT_KEY, 0);
+  prefs.putUShort(REQUEST_COUNT_KEY, uint16_t(count + 1));
+  prefs.end();
+}
+
+bool batterySamplingDue() {
+  prefs.begin("fridge", true);
+  uint8_t stored = prefs.getUChar(BATTERY_PERCENT_KEY, BATTERY_PERCENT_UNKNOWN);
+  uint16_t requests = prefs.getUShort(REQUEST_COUNT_KEY, 0);
+  uint16_t sampledAt = prefs.getUShort(BATTERY_SAMPLED_AT_KEY, 0);
+  prefs.end();
+  if (stored == BATTERY_PERCENT_UNKNOWN) {
+    return true; // nothing usable yet
+  }
+  if (!g_timerWakeup) {
+    return true; // a manual power cycle always refreshes the reading
+  }
+  return uint16_t(requests - sampledAt) >= BATTERY_SAMPLE_REQUESTS;
+}
+
+int readStoredBatteryPercent() {
+  prefs.begin("fridge", true);
+  uint8_t stored = prefs.getUChar(BATTERY_PERCENT_KEY, BATTERY_PERCENT_UNKNOWN);
+  prefs.end();
+  return stored == BATTERY_PERCENT_UNKNOWN ? -1 : int(stored);
+}
+
+int batteryPercentForDraw() {
+  if (!batterySamplingDue()) {
+    int stored = readStoredBatteryPercent();
+    Serial.print("Battery percent (cached): ");
+    Serial.println(stored);
+    return stored;
+  }
+  int percent = readBatteryPercent();
+  prefs.begin("fridge", false);
+  prefs.putUChar(BATTERY_PERCENT_KEY, uint8_t(percent < 0 ? BATTERY_PERCENT_UNKNOWN : percent));
+  prefs.putUShort(BATTERY_SAMPLED_AT_KEY, prefs.getUShort(REQUEST_COUNT_KEY, 0));
+  prefs.end();
+  return percent;
+}
+
 static void batteryDrawSprite(uint8_t* plane, int16_t x, int16_t y,
                               const uint8_t* sprite, uint16_t w, uint16_t h,
                               const String& orientation) {
@@ -1020,7 +1297,7 @@ bool drawStoredImage() {
 #elif FRIDGE_PANEL_TYPE == FRIDGE_PANEL_GDEY075Z08
   display.init();
   display.setRotation(0);
-  int batteryPercent = readBatteryPercent();
+  int batteryPercent = batteryPercentForDraw();
 
   // Write the two 1bpp planes one full screen at a time. This matches the
   // epaper-test full-window path and avoids many small partial-window writes,
@@ -1123,7 +1400,50 @@ void logHeap(const char* label) {
   Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
+uint32_t contentFingerprint(const char* line1, const char* line2, const char* line3, const char* line4) {
+  uint32_t hash = 2166136261u;
+  const char* parts[4] = { line1, line2, line3, line4 };
+  for (uint8_t i = 0; i < 4; i++) {
+    for (const char* p = parts[i]; p && *p; p++) {
+      hash ^= uint8_t(*p);
+      hash *= 16777619u;
+    }
+    hash ^= 0xFFu;
+    hash *= 16777619u;
+  }
+  return hash == 0 ? 1u : hash; // 0 is the "nothing stored" sentinel
+}
+
+uint32_t storedScreenFingerprint() {
+  prefs.begin("fridge", true);
+  uint32_t fingerprint = prefs.getUInt(SCREEN_FINGERPRINT_KEY, 0);
+  prefs.end();
+  return fingerprint;
+}
+
+void storeScreenFingerprint(uint32_t fingerprint) {
+  prefs.begin("fridge", false);
+  prefs.putUInt(SCREEN_FINGERPRINT_KEY, fingerprint);
+  prefs.end();
+}
+
+void clearScreenFingerprint() {
+  if (storedScreenFingerprint() == 0) {
+    return;
+  }
+  prefs.begin("fridge", false);
+  prefs.remove(SCREEN_FINGERPRINT_KEY);
+  prefs.end();
+}
+
 void drawStatusText(const char* line1, const char* line2, const char* line3, const char* line4) {
+  // One full refresh costs ~27 s of panel power. Repainting the exact page that is
+  // already on screen is pure waste, so identical content keeps the current image.
+  uint32_t fingerprint = contentFingerprint(line1, line2, line3, line4);
+  if (fingerprint == storedScreenFingerprint()) {
+    Serial.println("Same status page is already on screen; keeping the current image.");
+    return;
+  }
   display.init();
   display.setRotation(1);
   int16_t width = display.width();
@@ -1157,6 +1477,7 @@ void drawStatusText(const char* line1, const char* line2, const char* line3, con
     display.setCursor(textX, firstLineY + lineGap * 3);
     display.print(line4);
   } while (display.nextPage());
+  storeScreenFingerprint(fingerprint);
 }
 
 void setError(const char* title, const char* detail, const char* hint) {
@@ -1168,10 +1489,44 @@ void setError(const char* title, const char* detail, const char* hint) {
   Serial.println(detail);
 }
 
-void sleepForNextCheck(bool fastRetry, uint64_t elapsedUs) {
-  uint64_t targetInterval = fastRetry
-    ? FIRST_SETUP_RETRY_INTERVAL_US
-    : uint64_t(settings.checkIntervalMinutes) * 60ULL * 1000000ULL;
+// drawStatusText() already skips repainting an identical page, so this is only a
+// named alias for "show the current error".
+void drawErrorPage() {
+  drawStatusText(errorTitle, errorDetail, errorHint);
+}
+
+bool showStoredFrame() {
+  if (drawStoredImage()) {
+    clearScreenFingerprint();
+    return true;
+  }
+  drawErrorPage();
+  return false;
+}
+
+void sleepForNextCheck(bool failed, uint64_t elapsedUs) {
+  uint64_t targetInterval;
+  if (failed) {
+    recordFailure();
+    // 2, 4, 8, 16, 32, then the cap. Recovery clears the counter on the next
+    // successful wake, so a short outage costs at most one backoff step.
+    targetInterval = uint64_t(backoffSeconds(failCount)) * 1000000ULL;
+    Serial.print("Consecutive failures: ");
+    Serial.print(failCount);
+    Serial.print(", backoff seconds: ");
+    Serial.println(backoffSeconds(failCount));
+  } else {
+    clearFailures();
+    uint32_t targetSeconds = settings.checkIntervalMinutes * 60UL;
+    if (g_nextCheckSeconds > 0) {
+      // One-shot value from the server's smart schedule; the stored interval is
+      // untouched and is used again as soon as the header disappears.
+      targetSeconds = g_nextCheckSeconds;
+      Serial.print("Using smart schedule hint seconds: ");
+      Serial.println(targetSeconds);
+    }
+    targetInterval = uint64_t(targetSeconds) * 1000000ULL;
+  }
   uint64_t interval = targetInterval > elapsedUs
     ? targetInterval - elapsedUs
     : CONFIG_APPLY_RESTART_DELAY_US;
@@ -1185,7 +1540,10 @@ void sleepForNextCheck(bool fastRetry, uint64_t elapsedUs) {
   Serial.print("Sleeping for seconds: ");
   Serial.println(interval / 1000000ULL);
   Serial.flush();
-  delay(SERIAL_SLEEP_DELAY_MS);
+  if (!g_timerWakeup) {
+    // Only worth waiting on a human-triggered boot; timer wakes keep logging lean.
+    delay(SERIAL_SLEEP_DELAY_MS);
+  }
   if (EPD_PWR >= 0) {
     digitalWrite(EPD_PWR, LOW); // cut panel LDO during deep sleep
   }

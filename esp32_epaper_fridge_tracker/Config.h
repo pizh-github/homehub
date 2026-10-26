@@ -67,16 +67,35 @@ static const char* BACKUP_IMAGE_PATH = "/fridge4c.bak";
 static const uint32_t DEFAULT_CHECK_INTERVAL_MINUTES = 30;
 static const uint32_t MIN_CHECK_INTERVAL_MINUTES = 5;
 static const uint32_t MAX_CHECK_INTERVAL_MINUTES = 24UL * 60UL;
-static const uint64_t FIRST_SETUP_RETRY_INTERVAL_US = 2ULL * 60ULL * 1000000ULL;
-static const uint32_t WIFI_TIMEOUT_MS = 20000;
+static const uint64_t FIRST_SETUP_RETRY_INTERVAL_US = 2ULL * 60ULL * 1000000ULL; // backoff seed, see BACKOFF_MIN_SECONDS
+static const uint32_t WIFI_TIMEOUT_MS = 20000; // conservative budget until the device is registered
+static const uint32_t WIFI_TIMEOUT_MS_LOCAL = 8000;
+static const uint32_t WIFI_TIMEOUT_MS_PUBLIC = 10000;
+static const uint32_t WIFI_FAST_CONNECT_TIMEOUT_MS = 5000; // cached-channel attempt before a full scan
+static const uint32_t WIFI_MODEM_SLEEP_AFTER_MS = 4000; // start napping only once the wait goes long
+static const uint32_t BACKOFF_MIN_SECONDS = 120; // first retry delay; grows until it reaches interval
+// Not a policy limit: the hardware follows whatever the server asks for. This only
+// rejects absurd values (parsing errors) that would park the device for good.
+static const uint32_t SMART_HINT_SANITY_MAX_SECONDS = 7UL * 24UL * 60UL * 60UL;
+static const uint8_t BATTERY_SAMPLE_REQUESTS = 50; // sample every N frame requests (~1 day at 30 min)
+static const uint8_t BATTERY_PERCENT_UNKNOWN = 0xFF;
 static const uint32_t WIFI_MODE_TRANSITION_DELAY_MS = 100;
 static const uint32_t WIFI_AP_RETRY_DELAY_MS = 250;
 static const uint32_t DOWNLOAD_TIMEOUT_MS = 25000;
 static const uint32_t MAX_POWER_ON_PORTAL_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 static const uint64_t CONFIG_APPLY_RESTART_DELAY_US = 1ULL * 1000000ULL;
-static const uint32_t SERIAL_BOOT_DELAY_MS = 2500;
+static const uint32_t SERIAL_BOOT_DELAY_MS = 2500; // also the window for holding BOOT to clear settings
+static const uint32_t TIMER_WAKE_SERIAL_DELAY_MS = 100; // timer wakes need no boot window
 static const uint32_t SERIAL_SLEEP_DELAY_MS = 750;
 static const uint32_t SERIAL_BAUD_RATE = 115200;
+
+// NVS keys. Never reuse an existing key name for a new meaning.
+static const char* WIFI_CHANNEL_KEY = "wch";
+static const char* FAIL_COUNT_KEY = "failcount";
+static const char* SCREEN_FINGERPRINT_KEY = "screenfp";
+static const char* REQUEST_COUNT_KEY = "reqcount";
+static const char* BATTERY_PERCENT_KEY = "batpct";
+static const char* BATTERY_SAMPLED_AT_KEY = "batat";
 
 // Local development commonly uses HTTP. When later using HTTPS, provision a
 // trusted endpoint or replace this prototype setting with CA validation.

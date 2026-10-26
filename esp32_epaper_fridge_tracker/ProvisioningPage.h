@@ -46,7 +46,7 @@ const char PROVISIONING_PAGE[] PROGMEM = R"HTML(
         <input id="token" name="token" type="password" placeholder="已注册设备留空则保留；需要替换时再填写">
         <label for="interval">检查间隔（分钟）</label>
         <input id="interval" name="interval" type="number" min="5" max="1440" step="1" value="%INTERVAL%" required>
-        <p class="hint">设备按此间隔连接服务端检查新画面；只有内容变化时才刷新墨水屏。可设置 5–1440 分钟。手动开机后的配置热点不会超过这个间隔。</p>
+        <p class="hint">设备按此间隔连接服务端检查新画面；只有内容变化时才刷新墨水屏。可设置 5–1440 分钟。手动开机后的配置热点不会超过这个间隔。<b>此值会被账号中的设置覆盖</b>，以 H5 设备页为准。</p>
         <label for="orientation">显示方向</label>
         <select id="orientation" name="orientation">
           <option value="portrait"%PORTRAIT_SELECTED%>竖屏</option>

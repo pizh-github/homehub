@@ -22,7 +22,8 @@ const { createAiSettingsService } = require("./aiSettings");
 const { createAgentService } = require("./agent");
 const { DEFAULT_AGENT_INPUT_QUOTA, createAgentQuotaService, grantHistoricalAgentQuota } = require("./agentQuota");
 const { createMcpHandler } = require("./mcp");
-const { migrateFitnessTables, migrateFoodItemFields } = require("./migrations");
+const { migrateDeviceScheduleFields, migrateFitnessTables, migrateFoodItemFields } = require("./migrations");
+const { resolveScheduleReply, normalizeScheduleSettings, clampCheckIntervalMinutes } = require("./wakeSchedule");
 const { createFitnessService } = require("./fitness");
 const { RegistrationInviteError, createRegistrationInviteService } = require("./registrationInvites");
 const { createUserDeletionService } = require("./userDeletion");
@@ -306,6 +307,7 @@ function initializeDatabase() {
   migrateHouseholdScopeTables();
   migrateFoodItemFields(db);
   migrateFitnessTables(db);
+  migrateDeviceScheduleFields(db);
   migrateSystemAiSettings();
   migrateAgentMessagesTable();
   migrateAgentPendingActionsTable();
@@ -732,7 +734,15 @@ function publicDevice(device) {
     id: device.id,
     serial: device.serial,
     panelProfile: device.panel_profile,
-    lastSeenAt: device.last_seen_at
+    lastSeenAt: device.last_seen_at,
+    checkIntervalMinutes: device.check_interval_minutes,
+    smartSchedule: {
+      enabled: Boolean(device.smart_schedule_enabled),
+      busyStartMinute: device.busy_start_minute,
+      busyEndMinute: device.busy_end_minute,
+      busyIntervalSeconds: device.busy_interval_seconds,
+      idleIntervalSeconds: device.idle_interval_seconds
+    }
   };
 }
 
@@ -1031,16 +1041,31 @@ async function routeApi(req, res, url) {
     const panel = panelProfile(url.searchParams.get("panel") || device.panel_profile);
     const orientation = displayOrientation(url.searchParams.get("orientation") || DEFAULT_DISPLAY_ORIENTATION);
     const frame = await getRenderedFrame(device.household_id, panel, orientation);
+    const scheduleReply = resolveScheduleReply({
+      device,
+      reportedIntervalMinutes: Number(url.searchParams.get("interval") || 0) || 0,
+      timezone: config.timezone
+    });
+    const now = new Date().toISOString();
     db.prepare("UPDATE devices SET last_seen_at = ?, panel_profile = ?, updated_at = ? WHERE id = ?")
-      .run(new Date().toISOString(), panel, new Date().toISOString(), device.id);
+      .run(now, panel, now, device.id);
     if (req.headers["if-none-match"] === frame.etag) {
-      res.writeHead(304, { ETag: frame.etag, "Cache-Control": "no-cache" });
+      res.writeHead(304, {
+        ETag: frame.etag,
+        "Cache-Control": "no-cache",
+        ...scheduleReply.headers
+      });
       res.end();
       return true;
     }
     const data = url.pathname.endsWith(".png") ? frame.png : frame.frame;
     const type = url.pathname.endsWith(".png") ? "image/png" : "application/octet-stream";
-    const headers = { ETag: frame.etag, "X-Panel-Profile": panel, "X-Display-Orientation": orientation };
+    const headers = {
+      ETag: frame.etag,
+      "X-Panel-Profile": panel,
+      "X-Display-Orientation": orientation,
+      ...scheduleReply.headers
+    };
     if (!url.pathname.endsWith(".png")) headers["X-Frame-Format"] = panelConfig(panel).frameFormat;
     sendBuffer(res, 200, data, type, headers);
     return true;
@@ -1412,6 +1437,36 @@ async function routeApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/api/devices") {
     sendJson(res, 200, { devices: db.prepare("SELECT * FROM devices WHERE household_id = ?").all(householdId).map(publicDevice) });
+    return true;
+  }
+
+  const deviceScheduleMatch = url.pathname.match(/^\/api\/devices\/(\d+)\/schedule$/);
+  if (req.method === "PATCH" && deviceScheduleMatch) {
+    householdService.requireOwner(user.id);
+    const deviceId = Number(deviceScheduleMatch[1]);
+    const device = db.prepare("SELECT * FROM devices WHERE id = ? AND household_id = ?").get(deviceId, householdId);
+    if (!device) {
+      sendJson(res, 404, { error: "device not found" });
+      return true;
+    }
+    const body = await readJson(req);
+    const schedule = normalizeScheduleSettings(body, {
+      enabled: Boolean(device.smart_schedule_enabled),
+      busyStartMinute: device.busy_start_minute,
+      busyEndMinute: device.busy_end_minute,
+      busyIntervalSeconds: device.busy_interval_seconds,
+      idleIntervalSeconds: device.idle_interval_seconds
+    });
+    const intervalMinutes = body.checkIntervalMinutes === undefined
+      ? device.check_interval_minutes
+      : clampCheckIntervalMinutes(body.checkIntervalMinutes, device.check_interval_minutes);
+    db.prepare(`UPDATE devices SET smart_schedule_enabled = ?, busy_start_minute = ?, busy_end_minute = ?,
+                busy_interval_seconds = ?, idle_interval_seconds = ?, check_interval_minutes = ?,
+                updated_at = ? WHERE id = ?`)
+      .run(schedule.enabled ? 1 : 0, schedule.busyStartMinute, schedule.busyEndMinute,
+        schedule.busyIntervalSeconds, schedule.idleIntervalSeconds, intervalMinutes,
+        new Date().toISOString(), deviceId);
+    sendJson(res, 200, { device: publicDevice(db.prepare("SELECT * FROM devices WHERE id = ?").get(deviceId)) });
     return true;
   }
 

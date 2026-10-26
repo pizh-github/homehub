@@ -101,4 +101,23 @@ function migrateFitnessAerobicColumns(db) {
   }
 }
 
-module.exports = { migrateFitnessTables, migrateFoodItemFields };
+function migrateDeviceScheduleFields(db) {
+  const columns = new Set(db.prepare("PRAGMA table_info(devices)").all().map((column) => column.name));
+  // The server is authoritative for check_interval_minutes: the device reports its
+  // value on every request and gets the stored value back when they differ.
+  const additions = [
+    ["smart_schedule_enabled", "INTEGER NOT NULL DEFAULT 0"],
+    ["busy_start_minute", "INTEGER NOT NULL DEFAULT 420"],
+    ["busy_end_minute", "INTEGER NOT NULL DEFAULT 1380"],
+    ["busy_interval_seconds", "INTEGER NOT NULL DEFAULT 1800"],
+    ["idle_interval_seconds", "INTEGER NOT NULL DEFAULT 0"],
+    ["check_interval_minutes", "INTEGER NOT NULL DEFAULT 30"]
+  ];
+  for (const [name, ddl] of additions) {
+    if (!columns.has(name)) {
+      db.exec(`ALTER TABLE devices ADD COLUMN ${name} ${ddl}`);
+    }
+  }
+}
+
+module.exports = { migrateDeviceScheduleFields, migrateFitnessTables, migrateFoodItemFields };

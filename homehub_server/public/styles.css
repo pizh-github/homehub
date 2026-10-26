@@ -542,6 +542,26 @@ body.modal-open { overflow: hidden; }
   background: #f8faf7; border-radius: 15px;
 }
 .device strong { color: var(--ink); }
+.device > div:first-child { display: flex; flex-direction: column; gap: 4px; }
+.device-summary { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.device-summary b { color: var(--ink); }
+.device-schedule {
+  display: grid; gap: 7px; margin-top: 8px; padding-top: 12px;
+  border-top: 1px dashed var(--line);
+}
+.device-schedule label { display: grid; gap: 5px; font-size: 13px; font-weight: 720; color: var(--ink); }
+.device-schedule .device-check { display: flex; align-items: center; gap: 8px; }
+.device-schedule .device-check input { width: 17px; height: 17px; margin: 0; }
+.device-schedule input[type="time"],
+.device-schedule input[type="number"],
+.device-schedule select {
+  height: 38px; padding: 0 10px; border: 1px solid var(--line); border-radius: 9px;
+  background: #fff; color: var(--ink); font: inherit;
+}
+.device-range { display: flex; align-items: center; gap: 8px; }
+.device-range input { flex: 1; min-width: 0; }
+.device-range span { color: var(--muted); font-size: 13px; }
+.device-schedule button[type="submit"] { margin-top: 2px; }
 .status-dot { color: var(--green); font-size: 13px; }
 .status-dot::before { content: ""; display: inline-block; width: 8px; height: 8px; background: #45b676; border-radius: 50%; margin-right: 7px; }
 .user-layout { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 18px; align-items: stretch; }

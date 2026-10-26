@@ -648,6 +648,11 @@ async function loadHousehold() {
   $("#devicePairingHint").textContent = result.permissions.manageDevices
     ? "先生成一次性配对码，再在 ESP32 配网页填写该码。配对成功后设备会关联到当前家庭。"
     : "设备由家庭创建者管理；你仍可查看设备状态和共享的屏幕画面。";
+  if (state.devices.length) {
+    // loadDevices() may finish before the permissions above are known; re-render so
+    // the smart schedule form shows up for owners.
+    $("#devices").innerHTML = state.devices.map(renderDevice).join("");
+  }
 }
 
 async function handlePendingHouseholdInvite() {
@@ -1194,11 +1199,134 @@ async function loadDevices() {
     : `<strong>暂无已绑定设备</strong><span>${state.household?.permissions.manageDevices ? "前往设备页面生成配对码" : "请联系家庭创建者配对设备"}</span>`;
 }
 
+const SCHEDULE_INTERVAL_OPTIONS = [300, 600, 900, 1200, 1800, 3600, 7200];
+
+function scheduleIntervalLabel(seconds) {
+  if (!seconds) return "不刷新";
+  return seconds % 3600 === 0 ? `${seconds / 3600} 小时` : `${seconds / 60} 分钟`;
+}
+
+function minutesToTimeText(minutes) {
+  const safe = Math.max(0, Math.min(1439, Number(minutes) || 0));
+  return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
+}
+
+function timeTextToMinutes(value) {
+  const [hour, minute] = String(value || "").split(":").map(Number);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return 0;
+  return Math.max(0, Math.min(1439, hour * 60 + minute));
+}
+
+function scheduleSegmentMinutes(startMinutes, endMinutes) {
+  const span = (endMinutes - startMinutes + 1440) % 1440;
+  return span === 0 ? 1440 : span;
+}
+
+function scheduleIntervalOptionsHtml(selectedSeconds, segmentLengthMinutes) {
+  const options = [`<option value="0"${selectedSeconds ? "" : " selected"}>不刷新</option>`];
+  for (const seconds of SCHEDULE_INTERVAL_OPTIONS) {
+    const blocked = seconds / 60 > segmentLengthMinutes;
+    options.push(`<option value="${seconds}"${seconds === selectedSeconds ? " selected" : ""}${blocked ? " disabled" : ""}>${scheduleIntervalLabel(seconds)}</option>`);
+  }
+  return options.join("");
+}
+
+function syncScheduleIntervalSelect(select, segmentLengthMinutes, forcedDisabled) {
+  if (!select) return;
+  const previous = Number(select.value);
+  select.innerHTML = scheduleIntervalOptionsHtml(previous, segmentLengthMinutes);
+  select.disabled = Boolean(forcedDisabled);
+  const current = select.options[select.selectedIndex];
+  if (!current || current.disabled) {
+    const usable = [...select.options].filter((option) => !option.disabled);
+    if (usable.length) usable[usable.length - 1].selected = true;
+  }
+}
+
+function syncDeviceScheduleForm(form) {
+  const busySegment = scheduleSegmentMinutes(
+    timeTextToMinutes(form.elements.busyStart.value),
+    timeTextToMinutes(form.elements.busyEnd.value)
+  );
+  const idleSegment = 1440 - busySegment;
+  syncScheduleIntervalSelect(form.elements.busyInterval, busySegment, false);
+  syncScheduleIntervalSelect(form.elements.idleInterval, idleSegment, idleSegment < 5);
+}
+
 function renderDevice(device) {
-  return `<article class="device">
+  const schedule = device.smartSchedule || {};
+  const busyStartMinute = Number(schedule.busyStartMinute ?? 420);
+  const busyEndMinute = Number(schedule.busyEndMinute ?? 1380);
+  const busySegment = scheduleSegmentMinutes(busyStartMinute, busyEndMinute);
+  const idleSegment = 1440 - busySegment;
+  const head = `<div>
     <strong>${escapeHtml(device.serial)}</strong>
     <span>${escapeHtml(device.panelProfile)} · ${device.lastSeenAt ? `最近同步 ${escapeHtml(formatTime(device.lastSeenAt))}` : "等待首次同步"}</span>
+  </div>
+  <div class="device-summary">
+    检查间隔 <b>${escapeHtml(device.checkIntervalMinutes ?? 30)} 分钟</b>（智能调度关闭时生效）
+    · 智能调度 <b>${schedule.enabled ? "已开启" : "已关闭"}</b>
+  </div>`;
+  if (!state.household?.permissions?.manageDevices) {
+    return `<article class="device">${head}</article>`;
+  }
+  return `<article class="device">
+    ${head}
+    <button class="link" type="button" data-device-schedule="${device.id}">${schedule.enabled ? "修改" : "设置"}智能调度</button>
+    <form class="device-schedule hidden" data-device-schedule-form="${device.id}">
+      <label class="device-check"><input type="checkbox" name="enabled"${schedule.enabled ? " checked" : ""}> 启用智能调度</label>
+      <p class="muted">开启后服务端会在每次回复里给出下一次唤醒时间；关闭则使用下面的检查间隔。</p>
+      <label>繁忙时段</label>
+      <div class="device-range">
+        <input type="time" name="busyStart" value="${minutesToTimeText(busyStartMinute)}">
+        <span>至</span>
+        <input type="time" name="busyEnd" value="${minutesToTimeText(busyEndMinute)}">
+      </div>
+      <p class="muted">繁忙时段之外都算空闲时段；结束时间早于开始时间表示跨零点。</p>
+      <label>繁忙时段刷新间隔
+        <select name="busyInterval">${scheduleIntervalOptionsHtml(Number(schedule.busyIntervalSeconds ?? 1800), busySegment)}</select>
+      </label>
+      <label>空闲时段刷新间隔
+        <select name="idleInterval"${idleSegment < 5 ? " disabled" : ""}>${scheduleIntervalOptionsHtml(Number(schedule.idleIntervalSeconds ?? 0), idleSegment)}</select>
+      </label>
+      <p class="muted">时段装不下的选项会禁用。选「不刷新」时设备只在该时段结束时醒来。</p>
+      <label>检查间隔（分钟）
+        <input type="number" name="checkInterval" min="5" max="1440" step="1" value="${escapeHtml(device.checkIntervalMinutes ?? 30)}">
+      </label>
+      <p class="muted">智能调度关闭时按此间隔检查；开启时仅作兜底。</p>
+      <button type="submit">保存智能调度</button>
+    </form>
   </article>`;
+}
+
+async function saveDeviceSchedule(form) {
+  if (!form.elements.busyStart.value || !form.elements.busyEnd.value) {
+    toast("请填写繁忙时段的起止时间");
+    return;
+  }
+  if (form.elements.checkInterval.value === "") {
+    toast("请填写检查间隔（分钟）");
+    return;
+  }
+  const payload = {
+    enabled: form.elements.enabled.checked,
+    busyStartMinute: timeTextToMinutes(form.elements.busyStart.value),
+    busyEndMinute: timeTextToMinutes(form.elements.busyEnd.value),
+    busyIntervalSeconds: Number(form.elements.busyInterval.value),
+    idleIntervalSeconds: Number(form.elements.idleInterval.value),
+    checkIntervalMinutes: Number(form.elements.checkInterval.value)
+  };
+  try {
+    const result = await api(`/api/devices/${form.dataset.deviceScheduleForm}/schedule`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+    state.devices = state.devices.map((device) => (device.id === result.device.id ? result.device : device));
+    $("#devices").innerHTML = state.devices.map(renderDevice).join("");
+    toast("智能调度已保存");
+  } catch (error) {
+    toast(error.message || "保存失败");
+  }
 }
 
 async function loadUsers() {
@@ -2080,6 +2208,30 @@ $("#generatePairingCode").addEventListener("click", async () => {
   } catch (error) {
     toast(error.message);
   }
+});
+
+$("#devices").addEventListener("click", (event) => {
+  const toggle = event.target.closest("[data-device-schedule]");
+  if (!toggle) return;
+  const form = document.querySelector(`[data-device-schedule-form="${toggle.dataset.deviceSchedule}"]`);
+  if (!form) return;
+  form.classList.toggle("hidden");
+  if (!form.classList.contains("hidden")) syncDeviceScheduleForm(form);
+});
+
+$("#devices").addEventListener("change", (event) => {
+  const form = event.target.closest("[data-device-schedule-form]");
+  if (!form) return;
+  if (event.target.name === "busyStart" || event.target.name === "busyEnd") {
+    syncDeviceScheduleForm(form);
+  }
+});
+
+$("#devices").addEventListener("submit", (event) => {
+  const form = event.target.closest("[data-device-schedule-form]");
+  if (!form) return;
+  event.preventDefault();
+  saveDeviceSchedule(form);
 });
 
 $("#createHouseholdInvite").addEventListener("click", async () => {
