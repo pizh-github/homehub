@@ -620,3 +620,33 @@ test("day exercise edits are rejected for non-active days", () => {
   assert.throws(() => service.addCustomDayExercise(1, TODAY, { name: "农夫行走" }), /not active/);
   assert.throws(() => service.removeDayExercise(1, TODAY, 1), /not active/);
 });
+
+test("custom day exercise supports aerobic items", () => {
+  const db = createTestDatabase();
+  const service = createService(db);
+  service.createExercise(1, { name: "卧推", sets: 4, reps: 10, weightKg: 40 });
+  service.startDay(1, TODAY);
+
+  const afterAdd = service.addCustomDayExercise(1, TODAY, {
+    type: "aerobic",
+    name: "自定义慢跑",
+    defaultDurationMin: 25,
+    defaultDistanceKm: 4,
+    defaultIncline: 1
+  });
+  const aerobic = afterAdd.exercises.find((item) => item.name === "自定义慢跑");
+  assert.ok(aerobic, "aerobic item should join today");
+  assert.equal(aerobic.type, "aerobic");
+  assert.equal(aerobic.aerobic?.completed, false);
+  assert.equal(aerobic.aerobic?.durationMin, 25);
+  assert.ok(afterAdd.totalSets >= 2);
+
+  // 有氧条目不允许走力量式编辑，参数在打卡弹窗里调整
+  assert.throws(
+    () => service.updateDayExercise(1, TODAY, aerobic.exerciseId, { sets: 3 }),
+    /aerobic confirm dialog/
+  );
+
+  const afterRemove = service.removeDayExercise(1, TODAY, aerobic.exerciseId);
+  assert.equal(afterRemove.day.exercises.some((item) => item.exerciseId === aerobic.exerciseId), false);
+});

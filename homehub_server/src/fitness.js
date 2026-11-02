@@ -558,9 +558,10 @@ function createFitnessService({
 
   // Creates a brand-new exercise from free-form input and appends it to today's
   // workout. The item also shows up in the exercise library and can be archived there.
+  // type defaults to anaerobic; aerobic items take duration/distance/incline.
   function addCustomDayExercise(userId, date, input) {
     const existing = requireActiveDay(userId, date);
-    const created = createExercise(userId, { type: "anaerobic", ...input });
+    const created = createExercise(userId, input);
     const row = getExerciseRow(userId, created.id);
     const snapshot = readSnapshot(existing);
     snapshot.push(toSnapshot(row));
@@ -572,11 +573,17 @@ function createFitnessService({
       ).run(today(), nowIso, created.id);
       db.prepare("UPDATE fitness_workout_days SET selected_exercises_json = ? WHERE id = ?")
         .run(JSON.stringify(snapshot), existing.id);
-      const insertSet = db.prepare(
-        "INSERT INTO fitness_set_results (workout_day_id, exercise_id, set_index, completed) VALUES (?, ?, ?, 0)"
-      );
-      for (let setIndex = 0; setIndex < row.sets; setIndex += 1) {
-        insertSet.run(existing.id, created.id, setIndex);
+      if (row.type === "aerobic") {
+        db.prepare(
+          "INSERT INTO fitness_aerobic_results (workout_day_id, exercise_id, completed, duration_min, distance_km, incline) VALUES (?, ?, 0, ?, ?, ?)"
+        ).run(existing.id, created.id, row.default_duration_min, row.default_distance_km, row.default_incline);
+      } else {
+        const insertSet = db.prepare(
+          "INSERT INTO fitness_set_results (workout_day_id, exercise_id, set_index, completed) VALUES (?, ?, ?, 0)"
+        );
+        for (let setIndex = 0; setIndex < row.sets; setIndex += 1) {
+          insertSet.run(existing.id, created.id, setIndex);
+        }
       }
       db.exec("COMMIT");
     } catch (error) {
@@ -595,6 +602,10 @@ function createFitnessService({
     const index = snapshot.findIndex((entry) => Number(entry.exerciseId) === key);
     if (index < 0) throw new FitnessError("exercise is not part of this workout", 404);
     const item = snapshot[index];
+    if (item.type === "aerobic") {
+      // Aerobic entries are adjusted through the aerobic confirm dialog instead.
+      throw new FitnessError("aerobic items are edited via the aerobic confirm dialog");
+    }
     const nextSets = clampDayPatchNumber(patch.sets, item.sets, 1, 20, true);
     const nextReps = clampDayPatchNumber(patch.reps, item.reps, 1, 500, true);
     const nextWeight = clampDayPatchNumber(patch.weightKg, item.weightKg, 0, 1000, false);

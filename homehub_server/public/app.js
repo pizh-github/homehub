@@ -1270,8 +1270,13 @@ function renderDevice(device) {
   if (!state.household?.permissions?.manageDevices) {
     return `<article class="device">${head}</article>`;
   }
+  const isDemo = device.serial === "local-demo-screen";
+  const removeButton = isDemo
+    ? ""
+    : `<button class="link device-remove" type="button" data-device-remove="${device.id}">删除设备</button>`;
   return `<article class="device">
     ${head}
+    ${isDemo ? `<p class="muted">这是服务端内置的演示设备，仅供本地调试，重启服务后会自动出现。</p>` : ""}
     <form class="device-interval" data-device-interval-form="${device.id}">
       <label>检查间隔（分钟）· 智能调度关闭时生效
         <input type="number" name="checkInterval" min="5" max="1440" step="1" value="${escapeHtml(device.checkIntervalMinutes ?? 30)}">
@@ -1280,7 +1285,7 @@ function renderDevice(device) {
     </form>
     <div class="device-actions">
       <button class="link" type="button" data-device-schedule="${device.id}">${schedule.enabled ? "修改" : "设置"}智能调度</button>
-      <button class="link device-remove" type="button" data-device-remove="${device.id}">删除设备</button>
+      ${removeButton}
     </div>
     <form class="device-schedule hidden" data-device-schedule-form="${device.id}">
       <label class="device-check"><input type="checkbox" name="enabled"${schedule.enabled ? " checked" : ""}> 启用智能调度</label>
@@ -2233,15 +2238,19 @@ $("#devices").addEventListener("click", async (event) => {
   if (remove) {
     const target = state.devices.find((device) => device.id === Number(remove.dataset.deviceRemove));
     if (!target) return;
-    const confirmed = await confirmDialog({
+    const password = await confirmDialog({
       title: `删除 ${target.serial}？`,
-      body: "设备会立即失去访问权限；之后在设备配网页填新的配对码即可重新加入。",
+      body: "设备会立即失去访问权限；之后在设备配网页填新的配对码即可重新加入。这是危险操作，请输入当前账号密码确认。",
       confirmText: "删除",
-      tone: "danger"
+      tone: "danger",
+      needsPassword: true
     });
-    if (!confirmed) return;
+    if (!password) return;
     try {
-      await api(`/api/devices/${target.id}`, { method: "DELETE" });
+      await api(`/api/devices/${target.id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ password })
+      });
       toast("设备已删除");
       await loadDevices();
     } catch (error) {

@@ -1765,6 +1765,8 @@ body.presentation-view-active .quick-agent {
   border-radius: 9px; background: #fff; color: var(--ink); font: inherit;
 }
 .fitness-day-edit-actions { display: flex; gap: 8px; }
+.fitness-day-type { display: flex; gap: 8px; }
+.fitness-day-type .fitness-tool.is-active { color: #fff; background: var(--ink); border-color: var(--ink); }
 .fitness-day-custom {
   display: grid; gap: 9px; margin-top: 10px; padding: 13px;
   border: 1px dashed var(--line); border-radius: 13px; background: #f8faf7;

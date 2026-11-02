@@ -1490,6 +1490,12 @@ async function routeApi(req, res, url) {
   const deviceDeleteMatch = url.pathname.match(/^\/api\/devices\/(\d+)$/);
   if (req.method === "DELETE" && deviceDeleteMatch) {
     householdService.requireOwner(user.id);
+    const body = await readJson(req);
+    const operatorRow = db.prepare("SELECT password_hash FROM users WHERE id = ?").get(user.id);
+    if (!body.password || !operatorRow || !verifySecret(body.password, operatorRow.password_hash)) {
+      sendJson(res, 403, { error: "password is incorrect" });
+      return true;
+    }
     const deviceId = Number(deviceDeleteMatch[1]);
     const device = db.prepare("SELECT * FROM devices WHERE id = ? AND household_id = ?").get(deviceId, householdId);
     if (!device) {

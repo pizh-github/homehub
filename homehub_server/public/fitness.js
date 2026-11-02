@@ -12,6 +12,7 @@
     calendarMonth: "",
     history: [],
     customFormOpen: false,
+    customFormType: "anaerobic",
     editingExerciseId: null
   };
 
@@ -241,12 +242,18 @@
     if (item.type === "aerobic") {
       const done = Boolean(item.aerobic?.completed);
       const state = done ? "✓ 已完成" : "待打卡";
+      const rowTools = interactive
+        ? `<span class="fitness-today-tools">
+            <button type="button" class="quiet fitness-tool" data-fitness-remove="${item.exerciseId}">移除</button>
+          </span>`
+        : "";
       return `
         <article class="fitness-today-exercise is-aerobic${done ? " done" : ""}">
           <header>
             <strong>${escapeHtml(item.name)}</strong>
             <span class="muted">有氧</span>
             <em class="fitness-set-count">${state}</em>
+            ${rowTools}
           </header>
           <div class="fitness-aerobic-row">
             <button type="button" class="fitness-set fitness-aerobic-toggle${done ? " done" : ""}"
@@ -312,14 +319,28 @@
 
   function renderCustomForm() {
     if (!state.customFormOpen) return "";
-    return `
-      <form class="fitness-day-custom" data-fitness-custom-form>
-        <input name="name" maxlength="40" placeholder="项目名称，随意写（如：农夫行走 20 kg）" required>
+    const isAerobic = state.customFormType === "aerobic";
+    const fields = isAerobic
+      ? `
+        <div class="fitness-day-edit-fields">
+          <label>时长 分钟<input name="defaultDurationMin" type="number" min="0" placeholder="30"></label>
+          <label>距离 km<input name="defaultDistanceKm" type="number" step="0.1" min="0" placeholder="5"></label>
+          <label>坡度 %<input name="defaultIncline" type="number" step="0.5" min="0" placeholder="0"></label>
+        </div>`
+      : `
         <div class="fitness-day-edit-fields">
           <label>重量 kg<input name="weightKg" type="number" step="0.5" min="0" placeholder="0"></label>
           <label>次数<input name="reps" type="number" min="1" placeholder="12"></label>
           <label>组数<input name="sets" type="number" min="1" max="20" placeholder="3"></label>
+        </div>`;
+    return `
+      <form class="fitness-day-custom" data-fitness-custom-form>
+        <div class="fitness-day-type">
+          <button type="button" class="quiet fitness-tool${isAerobic ? "" : " is-active"}" data-fitness-custom-type="anaerobic">力量</button>
+          <button type="button" class="quiet fitness-tool${isAerobic ? " is-active" : ""}" data-fitness-custom-type="aerobic">有氧</button>
         </div>
+        <input name="name" maxlength="40" placeholder="项目名称，随意写（如：农夫行走 20 kg）" required>
+        ${fields}
         <div class="fitness-day-edit-actions">
           <button type="submit" class="primary">添加到今天</button>
           <button type="button" class="quiet" data-fitness-custom-cancel>取消</button>
@@ -830,6 +851,12 @@
       handleTodayAction(action.dataset.fitnessAction);
       return;
     }
+    const typeButton = event.target.closest("[data-fitness-custom-type]");
+    if (typeButton) {
+      state.customFormType = typeButton.dataset.fitnessCustomType;
+      renderToday(state.overview.today);
+      return;
+    }
     const editButton = event.target.closest("[data-fitness-edit]");
     if (editButton) {
       state.editingExerciseId = Number(editButton.dataset.fitnessEdit);
@@ -865,12 +892,22 @@
     const customForm = event.target.closest("[data-fitness-custom-form]");
     if (customForm) {
       event.preventDefault();
-      handleAddCustomDayExercise({
-        name: customForm.elements.name.value,
-        weightKg: customForm.elements.weightKg.value,
-        reps: customForm.elements.reps.value,
-        sets: customForm.elements.sets.value
-      });
+      const form = customForm.elements;
+      const payload = state.customFormType === "aerobic"
+        ? {
+            type: "aerobic",
+            name: form.name.value,
+            defaultDurationMin: form.defaultDurationMin.value,
+            defaultDistanceKm: form.defaultDistanceKm.value,
+            defaultIncline: form.defaultIncline.value
+          }
+        : {
+            name: form.name.value,
+            weightKg: form.weightKg.value,
+            reps: form.reps.value,
+            sets: form.sets.value
+          };
+      handleAddCustomDayExercise(payload);
     }
   });
 
