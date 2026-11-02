@@ -576,3 +576,47 @@ test("fitness surfaces are wired into navigation, api routes and checks", () => 
   assert.match(pkg.scripts.check, /src\/fitness\.js/);
   assert.match(pkg.scripts.check, /public\/fitness\.js/);
 });
+
+test("custom day exercise appends to today and edits keep completed sets", () => {
+  const db = createTestDatabase();
+  const service = createService(db);
+  service.createExercise(1, { name: "卧推", sets: 4, reps: 10, weightKg: 40 });
+  service.startDay(1, TODAY);
+
+  const afterAdd = service.addCustomDayExercise(1, TODAY, {
+    name: "农夫行走",
+    sets: 3,
+    reps: 8,
+    weightKg: 20
+  });
+  assert.equal(afterAdd.exercises.length, 2);
+  const custom = afterAdd.exercises.find((item) => item.name === "农夫行走");
+  assert.ok(custom, "custom item should join today");
+  service.toggleSet(1, TODAY, custom.exerciseId, 0);
+
+  const afterUpdate = service.updateDayExercise(1, TODAY, custom.exerciseId, {
+    sets: 2,
+    reps: 6,
+    weightKg: 22
+  });
+  const updated = afterUpdate.exercises.find((item) => item.exerciseId === custom.exerciseId);
+  assert.equal(updated.sets, 2);
+  assert.equal(updated.reps, 6);
+  assert.equal(updated.weightKg, 22);
+  assert.equal(updated.results.length, 2);
+  assert.equal(updated.results[0].completed, true);
+  assert.equal(updated.results[1].completed, false);
+
+  const afterRemove = service.removeDayExercise(1, TODAY, custom.exerciseId);
+  assert.equal(afterRemove.day.exercises.some((item) => item.exerciseId === custom.exerciseId), false);
+  assert.ok(service.listExercises(1).some((item) => item.name === "农夫行走"));
+});
+
+test("day exercise edits are rejected for non-active days", () => {
+  const db = createTestDatabase();
+  const service = createService(db);
+  service.createExercise(1, { name: "卧推" });
+  assert.throws(() => service.updateDayExercise(1, TODAY, 1, { sets: 2 }), /not active/);
+  assert.throws(() => service.addCustomDayExercise(1, TODAY, { name: "农夫行走" }), /not active/);
+  assert.throws(() => service.removeDayExercise(1, TODAY, 1), /not active/);
+});

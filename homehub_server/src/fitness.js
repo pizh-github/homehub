@@ -547,6 +547,125 @@ function createFitnessService({
     return { ...result.day, targetShort: result.targetShort };
   }
 
+  function requireActiveDay(userId, date) {
+    assertToday(date);
+    const existing = getDayRow(userId, date);
+    if (!existing || existing.status !== "active") {
+      throw new FitnessError("workout is not active; start it first", 409);
+    }
+    return existing;
+  }
+
+  // Creates a brand-new exercise from free-form input and appends it to today's
+  // workout. The item also shows up in the exercise library and can be archived there.
+  function addCustomDayExercise(userId, date, input) {
+    const existing = requireActiveDay(userId, date);
+    const created = createExercise(userId, { type: "anaerobic", ...input });
+    const row = getExerciseRow(userId, created.id);
+    const snapshot = readSnapshot(existing);
+    snapshot.push(toSnapshot(row));
+    const nowIso = new Date().toISOString();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare(
+        "UPDATE fitness_exercises SET selection_count = selection_count + 1, last_selected_date = ?, updated_at = ? WHERE id = ?"
+      ).run(today(), nowIso, created.id);
+      db.prepare("UPDATE fitness_workout_days SET selected_exercises_json = ? WHERE id = ?")
+        .run(JSON.stringify(snapshot), existing.id);
+      const insertSet = db.prepare(
+        "INSERT INTO fitness_set_results (workout_day_id, exercise_id, set_index, completed) VALUES (?, ?, ?, 0)"
+      );
+      for (let setIndex = 0; setIndex < row.sets; setIndex += 1) {
+        insertSet.run(existing.id, created.id, setIndex);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return getDay(userId, date);
+  }
+
+  // Edits a snapshot entry in place (sets / reps / weight). Completed sets survive:
+  // shrinking keeps the first N, growing appends unfinished sets at the end.
+  function updateDayExercise(userId, date, exerciseId, patch) {
+    const existing = requireActiveDay(userId, date);
+    const key = Number(exerciseId);
+    const snapshot = readSnapshot(existing);
+    const index = snapshot.findIndex((entry) => Number(entry.exerciseId) === key);
+    if (index < 0) throw new FitnessError("exercise is not part of this workout", 404);
+    const item = snapshot[index];
+    const nextSets = clampDayPatchNumber(patch.sets, item.sets, 1, 20, true);
+    const nextReps = clampDayPatchNumber(patch.reps, item.reps, 1, 500, true);
+    const nextWeight = clampDayPatchNumber(patch.weightKg, item.weightKg, 0, 1000, false);
+    snapshot[index] = { ...item, sets: nextSets, reps: nextReps, weightKg: nextWeight };
+    const nowIso = new Date().toISOString();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      if (nextSets !== item.sets) {
+        const kept = db
+          .prepare(
+            "SELECT set_index, completed FROM fitness_set_results WHERE workout_day_id = ? AND exercise_id = ? AND completed = 1 ORDER BY set_index"
+          )
+          .all(existing.id, key)
+          .map((result) => result.set_index)
+          .filter((setIndex) => setIndex < nextSets);
+        db.prepare("DELETE FROM fitness_set_results WHERE workout_day_id = ? AND exercise_id = ?")
+          .run(existing.id, key);
+        const insertSet = db.prepare(
+          "INSERT INTO fitness_set_results (workout_day_id, exercise_id, set_index, completed) VALUES (?, ?, ?, ?)"
+        );
+        for (let setIndex = 0; setIndex < nextSets; setIndex += 1) {
+          insertSet.run(existing.id, key, setIndex, kept.includes(setIndex) ? 1 : 0);
+        }
+      }
+      db.prepare("UPDATE fitness_workout_days SET selected_exercises_json = ? WHERE id = ?")
+        .run(JSON.stringify(snapshot), existing.id);
+      db.prepare("UPDATE fitness_exercises SET updated_at = ? WHERE id = ?").run(nowIso, key);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return getDay(userId, date);
+  }
+
+  // Removes an entry from today's workout only; the library item stays untouched.
+  function removeDayExercise(userId, date, exerciseId) {
+    const existing = requireActiveDay(userId, date);
+    const key = Number(exerciseId);
+    const snapshot = readSnapshot(existing);
+    const index = snapshot.findIndex((entry) => Number(entry.exerciseId) === key);
+    if (index < 0) throw new FitnessError("exercise is not part of this workout", 404);
+    const [removed] = snapshot.splice(index, 1);
+    const nowIso = new Date().toISOString();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare(
+        "UPDATE fitness_exercises SET selection_count = MAX(selection_count - 1, 0), updated_at = ? WHERE id = ?"
+      ).run(nowIso, key);
+      db.prepare("UPDATE fitness_workout_days SET selected_exercises_json = ? WHERE id = ?")
+        .run(JSON.stringify(snapshot), existing.id);
+      db.prepare("DELETE FROM fitness_set_results WHERE workout_day_id = ? AND exercise_id = ?")
+        .run(existing.id, key);
+      db.prepare("DELETE FROM fitness_aerobic_results WHERE workout_day_id = ? AND exercise_id = ?")
+        .run(existing.id, key);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return { day: getDay(userId, date), removed: removed.name };
+  }
+
+  function clampDayPatchNumber(value, fallback, min, max, integer) {
+    if (value === undefined || value === null || value === "") return fallback;
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    const rounded = integer ? Math.round(number) : Math.round(number * 10) / 10;
+    return Math.max(min, Math.min(max, rounded));
+  }
+
   function toggleSet(userId, date, exerciseId, setIndex) {
     assertToday(date);
     const existing = getDayRow(userId, date);
@@ -761,6 +880,9 @@ function createFitnessService({
     getHistory,
     getOverview,
     getSettings,
+    addCustomDayExercise,
+    updateDayExercise,
+    removeDayExercise,
     listExercises,
     planDay,
     regenerateDay,

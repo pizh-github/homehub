@@ -1272,10 +1272,19 @@ function renderDevice(device) {
   }
   return `<article class="device">
     ${head}
-    <button class="link" type="button" data-device-schedule="${device.id}">${schedule.enabled ? "修改" : "设置"}智能调度</button>
+    <form class="device-interval" data-device-interval-form="${device.id}">
+      <label>检查间隔（分钟）· 智能调度关闭时生效
+        <input type="number" name="checkInterval" min="5" max="1440" step="1" value="${escapeHtml(device.checkIntervalMinutes ?? 30)}">
+      </label>
+      <button type="submit" class="quiet">保存间隔</button>
+    </form>
+    <div class="device-actions">
+      <button class="link" type="button" data-device-schedule="${device.id}">${schedule.enabled ? "修改" : "设置"}智能调度</button>
+      <button class="link device-remove" type="button" data-device-remove="${device.id}">删除设备</button>
+    </div>
     <form class="device-schedule hidden" data-device-schedule-form="${device.id}">
       <label class="device-check"><input type="checkbox" name="enabled"${schedule.enabled ? " checked" : ""}> 启用智能调度</label>
-      <p class="muted">开启后服务端会在每次回复里给出下一次唤醒时间；关闭则使用下面的检查间隔。</p>
+      <p class="muted">开启后服务端会在每次回复里给出下一次唤醒时间，与检查间隔互斥；关闭则按上面的检查间隔运行。</p>
       <label>繁忙时段</label>
       <div class="device-range">
         <input type="time" name="busyStart" value="${minutesToTimeText(busyStartMinute)}">
@@ -1290,10 +1299,6 @@ function renderDevice(device) {
         <select name="idleInterval"${idleSegment < 5 ? " disabled" : ""}>${scheduleIntervalOptionsHtml(Number(schedule.idleIntervalSeconds ?? 0), idleSegment)}</select>
       </label>
       <p class="muted">时段装不下的选项会禁用。选「不刷新」时设备只在该时段结束时醒来。</p>
-      <label>检查间隔（分钟）
-        <input type="number" name="checkInterval" min="5" max="1440" step="1" value="${escapeHtml(device.checkIntervalMinutes ?? 30)}">
-      </label>
-      <p class="muted">智能调度关闭时按此间隔检查；开启时仅作兜底。</p>
       <button type="submit">保存智能调度</button>
     </form>
   </article>`;
@@ -1304,17 +1309,12 @@ async function saveDeviceSchedule(form) {
     toast("请填写繁忙时段的起止时间");
     return;
   }
-  if (form.elements.checkInterval.value === "") {
-    toast("请填写检查间隔（分钟）");
-    return;
-  }
   const payload = {
     enabled: form.elements.enabled.checked,
     busyStartMinute: timeTextToMinutes(form.elements.busyStart.value),
     busyEndMinute: timeTextToMinutes(form.elements.busyEnd.value),
     busyIntervalSeconds: Number(form.elements.busyInterval.value),
-    idleIntervalSeconds: Number(form.elements.idleInterval.value),
-    checkIntervalMinutes: Number(form.elements.checkInterval.value)
+    idleIntervalSeconds: Number(form.elements.idleInterval.value)
   };
   try {
     const result = await api(`/api/devices/${form.dataset.deviceScheduleForm}/schedule`, {
@@ -1324,6 +1324,24 @@ async function saveDeviceSchedule(form) {
     state.devices = state.devices.map((device) => (device.id === result.device.id ? result.device : device));
     $("#devices").innerHTML = state.devices.map(renderDevice).join("");
     toast("智能调度已保存");
+  } catch (error) {
+    toast(error.message || "保存失败");
+  }
+}
+
+async function saveDeviceInterval(form) {
+  if (form.elements.checkInterval.value === "") {
+    toast("请填写检查间隔（分钟）");
+    return;
+  }
+  try {
+    const result = await api(`/api/devices/${form.dataset.deviceIntervalForm}/schedule`, {
+      method: "PATCH",
+      body: JSON.stringify({ checkIntervalMinutes: Number(form.elements.checkInterval.value) })
+    });
+    state.devices = state.devices.map((device) => (device.id === result.device.id ? result.device : device));
+    $("#devices").innerHTML = state.devices.map(renderDevice).join("");
+    toast("检查间隔已保存，设备下次唤醒时同步");
   } catch (error) {
     toast(error.message || "保存失败");
   }
@@ -2210,7 +2228,27 @@ $("#generatePairingCode").addEventListener("click", async () => {
   }
 });
 
-$("#devices").addEventListener("click", (event) => {
+$("#devices").addEventListener("click", async (event) => {
+  const remove = event.target.closest("[data-device-remove]");
+  if (remove) {
+    const target = state.devices.find((device) => device.id === Number(remove.dataset.deviceRemove));
+    if (!target) return;
+    const confirmed = await confirmDialog({
+      title: `删除 ${target.serial}？`,
+      body: "设备会立即失去访问权限；之后在设备配网页填新的配对码即可重新加入。",
+      confirmText: "删除",
+      tone: "danger"
+    });
+    if (!confirmed) return;
+    try {
+      await api(`/api/devices/${target.id}`, { method: "DELETE" });
+      toast("设备已删除");
+      await loadDevices();
+    } catch (error) {
+      toast(error.message || "删除失败");
+    }
+    return;
+  }
   const toggle = event.target.closest("[data-device-schedule]");
   if (!toggle) return;
   const form = document.querySelector(`[data-device-schedule-form="${toggle.dataset.deviceSchedule}"]`);
@@ -2228,10 +2266,17 @@ $("#devices").addEventListener("change", (event) => {
 });
 
 $("#devices").addEventListener("submit", (event) => {
-  const form = event.target.closest("[data-device-schedule-form]");
-  if (!form) return;
-  event.preventDefault();
-  saveDeviceSchedule(form);
+  const scheduleForm = event.target.closest("[data-device-schedule-form]");
+  if (scheduleForm) {
+    event.preventDefault();
+    saveDeviceSchedule(scheduleForm);
+    return;
+  }
+  const intervalForm = event.target.closest("[data-device-interval-form]");
+  if (intervalForm) {
+    event.preventDefault();
+    saveDeviceInterval(intervalForm);
+  }
 });
 
 $("#createHouseholdInvite").addEventListener("click", async () => {

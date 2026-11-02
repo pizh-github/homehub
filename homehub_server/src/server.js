@@ -875,6 +875,23 @@ async function routeFitnessApi(req, res, url, user) {
     sendJson(res, 200, fitnessService.setAerobicResult(userId, date, Number(fitnessAerobicMatch[2]), await readJson(req)));
     return;
   }
+  const fitnessCustomMatch = url.pathname.match(/^\/api\/fitness\/days\/([^/]+)\/custom$/);
+  if (fitnessCustomMatch && req.method === "POST") {
+    const date = decodeURIComponent(fitnessCustomMatch[1]);
+    sendJson(res, 200, fitnessService.addCustomDayExercise(userId, date, await readJson(req)));
+    return;
+  }
+  const fitnessDayExerciseMatch = url.pathname.match(/^\/api\/fitness\/days\/([^/]+)\/exercises\/(\d+)$/);
+  if (fitnessDayExerciseMatch && req.method === "PATCH") {
+    const date = decodeURIComponent(fitnessDayExerciseMatch[1]);
+    sendJson(res, 200, fitnessService.updateDayExercise(userId, date, Number(fitnessDayExerciseMatch[2]), await readJson(req)));
+    return;
+  }
+  if (fitnessDayExerciseMatch && req.method === "DELETE") {
+    const date = decodeURIComponent(fitnessDayExerciseMatch[1]);
+    sendJson(res, 200, fitnessService.removeDayExercise(userId, date, Number(fitnessDayExerciseMatch[2])));
+    return;
+  }
   sendJson(res, 404, { error: "not found" });
 }
 
@@ -1467,6 +1484,20 @@ async function routeApi(req, res, url) {
         schedule.busyIntervalSeconds, schedule.idleIntervalSeconds, intervalMinutes,
         new Date().toISOString(), deviceId);
     sendJson(res, 200, { device: publicDevice(db.prepare("SELECT * FROM devices WHERE id = ?").get(deviceId)) });
+    return true;
+  }
+
+  const deviceDeleteMatch = url.pathname.match(/^\/api\/devices\/(\d+)$/);
+  if (req.method === "DELETE" && deviceDeleteMatch) {
+    householdService.requireOwner(user.id);
+    const deviceId = Number(deviceDeleteMatch[1]);
+    const device = db.prepare("SELECT * FROM devices WHERE id = ? AND household_id = ?").get(deviceId, householdId);
+    if (!device) {
+      sendJson(res, 404, { error: "device not found" });
+      return true;
+    }
+    db.prepare("DELETE FROM devices WHERE id = ?").run(deviceId);
+    sendJson(res, 200, { ok: true, removed: device.serial });
     return true;
   }
 

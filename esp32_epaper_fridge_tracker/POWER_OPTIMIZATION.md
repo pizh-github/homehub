@@ -31,8 +31,9 @@
 | 2 | 数据库列 | `src/migrations.js` | `devices` 表启动时自动加 6 列：`smart_schedule_enabled`、`busy_start_minute`、`busy_end_minute`、`busy_interval_seconds`、`idle_interval_seconds`、`check_interval_minutes`，无需手工迁移 |
 | 3 | 帧端点接入 | `src/server.js` | `frame.bin` / `frame.png` 的 **200 和 304** 都下发调度头；同一次请求完成 interval 上报比对 |
 | 4 | 设备调度 API | `src/server.js` | `PATCH /api/devices/:id/schedule`（owner 权限），服务端做与前端一致的钳制并回显实际生效值；`GET /api/devices` 返回调度字段 |
-| 5 | H5 设备页 | `public/app.js` / `public/styles.css` | 设备卡片显示检查间隔（智能调度关闭时生效）与开关状态；owner 可展开表单配置繁忙时段、两个刷新间隔下拉与检查间隔；时段长度变化时实时禁用装不下的选项 |
-| 6 | 语法检查 | `package.json` | `npm run check` 纳入 `src/wakeSchedule.js` |
+| 5 | 删除设备 API | `src/server.js` | `DELETE /api/devices/:id`（owner 权限，仅限本家庭设备）；删除后该设备 token 立即失效，用新配对码重新配对即可再次加入 |
+| 6 | H5 设备页 | `public/app.js` / `public/styles.css` | 设备卡片显示检查间隔与开关状态；「检查间隔」为独立小表单（智能调度关闭时生效），与智能调度表单互斥、分开保存；owner 可展开智能调度表单配置繁忙时段与两个刷新间隔下拉，并可删除设备（红色危险确认框）；时段长度变化时实时禁用装不下的选项 |
+| 7 | 语法检查 | `package.json` | `npm run check` 纳入 `src/wakeSchedule.js` |
 
 ## 三、智能调度的规则（一句话版）
 
@@ -93,3 +94,10 @@ hint = min(当前时段配置的间隔, 到时段边界的剩余秒数)
 3. 断网几分钟观察退避序列与恢复后 `failCount` 归零。
 4. H5 修改 interval / 时段后，等设备下一次唤醒，确认 `Sleeping for seconds` 与
    `Interval updated by server` 日志符合预期。
+
+## 六、附加 UI 调整
+
+- **面板预览下拉**：本机的 GDEY075Z08 7.5 寸三色移到首位并设为默认。
+- **健身 · 按钮位置**：「重新生成」从训练进行中的按钮行挪到「今日训练」卡片右上角的小按钮，不再与「结束训练」挤在一起。
+- **健身 · 自定义项目**：训练进行中可点「自定义项目」随时追加任意条目（名称随意写，重量/次数/组数可留空用默认值）；当天每个条目可「编辑」（改重量/次数/组数，已完成的打卡按组多退少补）和「移除」（只影响当天，项目库保留）。
+- 服务端新增 `POST /api/fitness/days/:date/custom` 与 `PATCH|DELETE /api/fitness/days/:date/exercises/:exerciseId`；新增单测覆盖追加、组数变化保留已完成打卡、非进行中日期拒绝。

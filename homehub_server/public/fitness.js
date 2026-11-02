@@ -10,7 +10,9 @@
     settings: null,
     calendar: { month: "", today: "", days: {} },
     calendarMonth: "",
-    history: []
+    history: [],
+    customFormOpen: false,
+    editingExerciseId: null
   };
 
   const els = {
@@ -19,6 +21,8 @@
     todayState: $("#fitnessTodayState"),
     todayHint: $("#fitnessTodayHint"),
     today: $("#fitnessToday"),
+    regenerate: $("#fitnessRegenerate"),
+    custom: $("#fitnessCustom"),
     exercises: $("#fitnessExercises"),
     addExercise: $("#fitnessAddExercise"),
     calendarMonth: $("#fitnessCalendarMonth"),
@@ -258,19 +262,75 @@
       `;
     }
     const doneCount = item.results.filter((result) => result.completed).length;
+    if (interactive && state.editingExerciseId === item.exerciseId) {
+      return `
+        <article class="fitness-today-exercise is-editing">
+          <form class="fitness-day-edit" data-fitness-edit-form="${item.exerciseId}">
+            <strong>${escapeHtml(item.name)}</strong>
+            <div class="fitness-day-edit-fields">
+              <label>重量 kg<input name="weightKg" type="number" step="0.5" min="0" value="${formatMetric(item.weightKg)}"></label>
+              <label>次数<input name="reps" type="number" min="1" value="${formatMetric(item.reps)}"></label>
+              <label>组数<input name="sets" type="number" min="1" max="20" value="${formatMetric(item.sets)}"></label>
+            </div>
+            <div class="fitness-day-edit-actions">
+              <button type="submit" class="primary">保存</button>
+              <button type="button" class="quiet" data-fitness-edit-cancel>取消</button>
+            </div>
+            <p class="muted">改组数会保留已完成的打卡（多退少补）。</p>
+          </form>
+        </article>
+      `;
+    }
+    const rowTools = interactive
+      ? `<span class="fitness-today-tools">
+          <button type="button" class="quiet fitness-tool" data-fitness-edit="${item.exerciseId}">编辑</button>
+          <button type="button" class="quiet fitness-tool" data-fitness-remove="${item.exerciseId}">移除</button>
+        </span>`
+      : "";
     return `
       <article class="fitness-today-exercise">
         <header>
           <strong>${escapeHtml(item.name)}</strong>
           <span class="muted">${weightText(item)} × ${item.reps} 次 × ${item.sets} 组</span>
           <em class="fitness-set-count">${doneCount}/${item.sets}</em>
+          ${rowTools}
         </header>
         <div class="fitness-sets">${renderSetBlocks(item, interactive)}</div>
       </article>
     `;
   }
 
+  function syncTodayTools(day) {
+    const active = day.status === "active";
+    els.regenerate.classList.toggle("hidden", !active);
+    els.custom.classList.toggle("hidden", !active);
+    if (!active) {
+      state.customFormOpen = false;
+      state.editingExerciseId = null;
+    }
+  }
+
+  function renderCustomForm() {
+    if (!state.customFormOpen) return "";
+    return `
+      <form class="fitness-day-custom" data-fitness-custom-form>
+        <input name="name" maxlength="40" placeholder="项目名称，随意写（如：农夫行走 20 kg）" required>
+        <div class="fitness-day-edit-fields">
+          <label>重量 kg<input name="weightKg" type="number" step="0.5" min="0" placeholder="0"></label>
+          <label>次数<input name="reps" type="number" min="1" placeholder="12"></label>
+          <label>组数<input name="sets" type="number" min="1" max="20" placeholder="3"></label>
+        </div>
+        <div class="fitness-day-edit-actions">
+          <button type="submit" class="primary">添加到今天</button>
+          <button type="button" class="quiet" data-fitness-custom-cancel>取消</button>
+        </div>
+        <p class="muted">会同时保存到「训练项目」库，不想再练可以在那里归档。</p>
+      </form>
+    `;
+  }
+
   function renderToday(day) {
+    syncTodayTools(day);
     const label = STATUS_LABELS[day.status] || "";
     els.todayState.textContent = label;
     els.todayState.className = `pill fitness-status-${day.status}`;
@@ -291,13 +351,13 @@
       </div>
     `;
     if (day.status === "active") {
-      els.todayHint.textContent = "完成一组点一下打卡，点错了再点一下取消。";
+      els.todayHint.textContent = "完成一组点一下打卡；「编辑」改重量/次数/组数，「移除」从今天去掉。";
       els.today.innerHTML = `
         ${progress}
         <div class="fitness-today-list">${day.exercises.map((item) => renderTodayExercise(item, true)).join("")}</div>
+        ${renderCustomForm()}
         <div class="fitness-today-actions">
           <button type="button" class="primary" data-fitness-action="finish">结束训练</button>
-          <button type="button" class="quiet" data-fitness-action="regenerate">重新生成</button>
         </div>
       `;
       return;
@@ -553,6 +613,52 @@
     }
   }
 
+  async function handleAddCustomDayExercise(input) {
+    try {
+      await api(`/api/fitness/days/${todayKey()}/custom`, { method: "POST", body: JSON.stringify(input) });
+      state.customFormOpen = false;
+      toast("已添加到今天的训练");
+      await refreshTodayPart();
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
+  async function handleUpdateDayExercise(exerciseId, patch) {
+    try {
+      await api(`/api/fitness/days/${todayKey()}/exercises/${exerciseId}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      });
+      state.editingExerciseId = null;
+      toast("已更新");
+      await refreshTodayPart();
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
+  async function handleRemoveDayExercise(exerciseId) {
+    const item = state.overview.today.exercises.find(
+      (entry) => Number(entry.exerciseId) === Number(exerciseId)
+    );
+    const confirmed = await confirmAction({
+      eyebrow: "移除项目",
+      title: `从今天移除「${item?.name || "该项目"}」？`,
+      body: "只影响今天；训练项目库里的条目保留，它今天的打卡记录会被清掉。",
+      confirmText: "移除",
+      tone: "danger"
+    });
+    if (!confirmed) return;
+    try {
+      await api(`/api/fitness/days/${todayKey()}/exercises/${exerciseId}`, { method: "DELETE" });
+      toast("已从今天移除");
+      await refreshTodayPart();
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
   async function handleDeleteExercise(id) {
     const exercise = state.exercises.find((item) => String(item.id) === String(id));
     const confirmed = await confirmAction({
@@ -720,7 +826,59 @@
       return;
     }
     const action = event.target.closest("[data-fitness-action]");
-    if (action) handleTodayAction(action.dataset.fitnessAction);
+    if (action) {
+      handleTodayAction(action.dataset.fitnessAction);
+      return;
+    }
+    const editButton = event.target.closest("[data-fitness-edit]");
+    if (editButton) {
+      state.editingExerciseId = Number(editButton.dataset.fitnessEdit);
+      state.customFormOpen = false;
+      renderToday(state.overview.today);
+      return;
+    }
+    if (event.target.closest("[data-fitness-edit-cancel]")) {
+      state.editingExerciseId = null;
+      renderToday(state.overview.today);
+      return;
+    }
+    if (event.target.closest("[data-fitness-custom-cancel]")) {
+      state.customFormOpen = false;
+      renderToday(state.overview.today);
+      return;
+    }
+    const removeButton = event.target.closest("[data-fitness-remove]");
+    if (removeButton) handleRemoveDayExercise(removeButton.dataset.fitnessRemove);
+  });
+
+  els.today.addEventListener("submit", (event) => {
+    const editForm = event.target.closest("[data-fitness-edit-form]");
+    if (editForm) {
+      event.preventDefault();
+      handleUpdateDayExercise(editForm.dataset.fitnessEditForm, {
+        weightKg: editForm.elements.weightKg.value,
+        reps: editForm.elements.reps.value,
+        sets: editForm.elements.sets.value
+      });
+      return;
+    }
+    const customForm = event.target.closest("[data-fitness-custom-form]");
+    if (customForm) {
+      event.preventDefault();
+      handleAddCustomDayExercise({
+        name: customForm.elements.name.value,
+        weightKg: customForm.elements.weightKg.value,
+        reps: customForm.elements.reps.value,
+        sets: customForm.elements.sets.value
+      });
+    }
+  });
+
+  els.regenerate.addEventListener("click", () => handleTodayAction("regenerate"));
+  els.custom.addEventListener("click", () => {
+    state.customFormOpen = !state.customFormOpen;
+    state.editingExerciseId = null;
+    if (state.overview?.today) renderToday(state.overview.today);
   });
 
   els.exercises.addEventListener("click", (event) => {
